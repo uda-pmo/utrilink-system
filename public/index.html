@@ -1,19 +1,49 @@
-<!doctype html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>NutriLink | 代工协同中心</title><link rel="stylesheet" href="/styles.css"></head><body><div id="auth" class="auth"><section><div class="brand"><i>N</i>NutriLink</div><h1>代工协同中心</h1><p>登录后统一管理合同、生产节点与归档文件。</p><form id="authForm"><label>姓名（首次注册）<input name="name" placeholder="林雨"></label><label>工作邮箱<input type="email" name="email" required placeholder="you@company.com"></label><label>密码<input type="password" name="password" required minlength="8" placeholder="至少 8 位"></label><button>登录</button><button type="button" class="secondary" id="register">创建账号</button><small id="authError"></small></form></section></div><div id="app" hidden><aside><div class="brand"><i>N</i>NutriLink</div><p>跨境保健品代工协同</p><button class="nav active" data-page="orders">代工订单</button><button class="nav" data-page="files">文档归档</button><div class="account"><b id="who"></b><button id="logout">退出登录</button></div></aside><main><header><div><b>代工订单</b><span>合同与生产资料统一留存</span></div><button id="newOrder">+ 新建代工订单</button></header><section id="content"></section></main></div><dialog id="modal"><form id="orderForm"><div class="modalHead"><h2 id="modalTitle">新建代工订单</h2><button type="button" class="close" id="closeModal">x</button></div><div class="grid"><label>合同号 *<input name="contract_no" required></label><label>工厂名称 *<input name="factory_name" required></label><label>批号<input name="batch_no"></label><label>产品 SKU *<input name="sku" required></label><label>当前节点<input name="node" placeholder="例如：原料进厂验收"></label><label>约定交期<input type="date" name="due_date"></label><label>生产数量<input name="quantity"></label><label>整体进度 (%)<input type="number" min="0" max="100" name="progress" value="0"></label><label>订单状态<input name="status" value="待确认"></label><label>配方版本<input name="formula_version"></label><label>包装规格<input name="pack_spec"></label><label>生产日期<input type="date" name="production_date"></label><label>保质期<input name="shelf_life"></label><label>到期日期<input type="date" name="expiry_date"></label><label class="wide">完整配方<textarea name="formula"></textarea></label></div><footer><button type="button" class="secondary" id="cancel">取消</button><button>保存订单</button></footer></form></dialog><dialog id="detail"><div id="detailBody"></div></dialog><script>const api = async (url, options = {}) => { const token = localStorage.token; const response = await fetch(url, { ...options, headers: { ...(options.body instanceof FormData ? {} : {'Content-Type':'application/json'}), ...(token ? {Authorization:`Bearer ${token}`} : {}) } }); if (!response.ok) throw new Error((await response.json().catch(()=>({}))).error || '操作失败'); return response.status === 204 ? null : response.json(); };
-const $ = s => document.querySelector(s); let orders = [], editing = null;
-function esc(v='') { const x = document.createElement('span'); x.textContent = v; return x.innerHTML; }
-async function signIn(register) { const f = new FormData($('#authForm')); try { const result = await api(register ? '/api/auth/register' : '/api/auth/login', {method:'POST',body:JSON.stringify(Object.fromEntries(f))}); localStorage.token=result.token; location.replace('/'); } catch(e) { $('#authError').textContent=e.message; } }
-async function start(user) { $('#auth').hidden=true; $('#app').hidden=false; $('#who').textContent=user.name; await loadOrders(); }
-async function loadOrders() { orders=await api('/api/orders'); renderOrders(); }
-function renderOrders() { $('#content').innerHTML=`<div class="toolbar"><input id="search" placeholder="搜索合同号、工厂名称或 SKU"><span>${orders.length} 个订单</span></div><section class="panel"><table><thead><tr><th>合同号</th><th>工厂名称</th><th>批号</th><th>产品 SKU</th><th>当前节点</th><th>交期</th><th>进度</th><th></th></tr></thead><tbody id="rows"></tbody></table></section>`; const draw = q => $('#rows').innerHTML=orders.filter(o=>`${o.contract_no}${o.factory_name}${o.sku}`.toLowerCase().includes(q.toLowerCase())).map(o=>`<tr><td><b>${esc(o.contract_no)}</b></td><td>${esc(o.factory_name)}</td><td>${esc(o.batch_no)}</td><td>${esc(o.sku)}</td><td>${esc(o.node)}</td><td>${esc(o.due_date)}</td><td><div class="progress"><i style="width:${Math.min(100,Math.max(0,o.progress||0))}%"></i></div>${o.progress||0}%</td><td><button class="link" onclick="openDetail(${o.id})">详情</button><button class="link" onclick="editOrder(${o.id})">编辑</button></td></tr>`).join('') || '<tr><td colspan="8" class="empty">还没有订单，点击右上角新建第一份代工订单。</td></tr>'; draw(''); $('#search').oninput=e=>draw(e.target.value); }
-function fields(o={}) { const f=$('#orderForm'); Object.entries(o).forEach(([k,v])=>{ if(f.elements[k]) f.elements[k].value=v ?? ''; }); }
-function openForm(o) { editing=o||null; $('#modalTitle').textContent=o?'编辑代工订单':'新建代工订单'; $('#orderForm').reset(); fields(o); $('#modal').showModal(); }
-window.editOrder=id=>openForm(orders.find(o=>o.id===id)); $('#newOrder').onclick=()=>openForm(); $('#closeModal').onclick=$('#cancel').onclick=()=>$('#modal').close();
-$('#orderForm').onsubmit=async e=>{e.preventDefault(); const data=Object.fromEntries(new FormData(e.target)); data.progress=Number(data.progress||0); try { await api(editing?`/api/orders/${editing.id}`:'/api/orders',{method:editing?'PUT':'POST',body:JSON.stringify(data)}); $('#modal').close(); await loadOrders(); } catch(err){alert(err.message)} };
-window.openDetail=async id=>{ const o=await api(`/api/orders/${id}`); $('#detailBody').innerHTML=`<div class="modalHead"><div><h2>${esc(o.contract_no)}</h2><p>${esc(o.sku)} | ${esc(o.factory_name)}</p></div><button class="close" onclick="detail.close()">x</button></div><div class="facts">${[['批号',o.batch_no],['当前节点',o.node],['交期',o.due_date],['数量',o.quantity],['状态',o.status],['配方版本',o.formula_version],['包装规格',o.pack_spec],['生产日期',o.production_date],['保质期',o.shelf_life],['到期日期',o.expiry_date]].map(x=>`<div><small>${x[0]}</small><b>${esc(x[1])}</b></div>`).join('')}</div><div class="formula"><small>完整配方</small><p>${esc(o.formula)}</p></div><section class="documents"><div><h3>订单文件</h3><form id="uploadForm"><input type="file" name="file" required><button>上传文件</button></form></div><ul>${o.files.map(f=>`<li><span>${esc(f.original_name)}</span><span class="fileActions"><button class="eye" title="预览文件" onclick="previewFile(${f.id})" aria-label="预览文件"></button><button class="download" onclick="downloadFile(${f.id},'${esc(f.original_name)}')">下载</button><button class="delete" onclick="deleteFile(${f.id},${o.id})">删除</button></span></li>`).join('')||'<li class="empty">尚未上传文件。</li>'}</ul></section>`; $('#detail').showModal(); $('#uploadForm').onsubmit=async e=>{e.preventDefault();try{await api(`/api/orders/${o.id}/files`,{method:'POST',body:new FormData(e.target)});openDetail(o.id)}catch(err){alert(err.message)}}; };
-async function getFile(id){const r=await fetch(`/api/files/${id}`,{headers:{Authorization:`Bearer ${localStorage.token}`}});if(!r.ok)throw new Error('文件读取失败');return r.blob()}
-window.previewFile=async id=>{ const url=URL.createObjectURL(await getFile(id)); window.open(url,'_blank','noopener'); };
-window.downloadFile=async(id,name)=>{const a=document.createElement('a');a.href=URL.createObjectURL(await getFile(id));a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000)};
-window.deleteFile=async(id,orderId)=>{if(confirm('确认删除这个文件？')){await api(`/api/files/${id}`,{method:'DELETE'});openDetail(orderId)}};
-$('#authForm').onsubmit=e=>{e.preventDefault();signIn(false)}; $('#register').onclick=()=>signIn(true); $('#logout').onclick=()=>{localStorage.removeItem('token');location.reload()};
-(async()=>{if(localStorage.token)try{start((await api('/api/auth/me')).user)}catch{localStorage.removeItem('token')}})();
-</script></body></html>
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>NutriLink | 代工协同中心</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <section id="auth" class="auth">
+    <form id="authForm" class="auth-card">
+      <div class="brand"><i>N</i><span>NutriLink</span></div>
+      <h1>代工协同中心</h1>
+      <p>登录后统一管理合同、生产节点与归档文件。</p>
+      <label>姓名（首次注册）<input name="name" placeholder="林雨"></label>
+      <label>工作邮箱<input name="email" type="email" required placeholder="you@company.com"></label>
+      <label>密码<input name="password" type="password" required minlength="8" placeholder="至少 8 位"></label>
+      <button type="submit" class="primary">登录</button>
+      <button type="button" id="register" class="secondary">创建账号</button>
+      <small id="authError"></small>
+    </form>
+  </section>
+
+  <div id="app" class="app-shell" hidden>
+    <aside class="sidebar">
+      <div class="brand"><i>N</i><span>NutriLink</span></div>
+      <p class="workspace-label">跨境保健品代工协同</p>
+      <nav aria-label="主导航">
+        <button class="nav active" data-view="dashboard">工作看板</button>
+        <button class="nav" data-view="orders">代工订单</button>
+        <button class="nav" data-view="documents">文档归档</button>
+        <button class="nav" data-view="factories">互联工厂</button>
+      </nav>
+      <div class="account"><b id="who"></b><small id="role"></small><button id="logout">退出登录</button></div>
+    </aside>
+    <main>
+      <header class="topbar">
+        <div><b id="crumb">工作看板</b><span id="subtitle">实时追踪跨境代工订单与合规文件状态</span></div>
+        <div class="header-actions"><button id="export" class="outline" title="导出当前列表">导出</button><button id="newOrder" class="primary">+ 新建代工订单</button></div>
+      </header>
+      <section id="content"></section>
+    </main>
+  </div>
+
+  <dialog id="orderModal" class="modal"><form id="orderForm"></form></dialog>
+  <dialog id="detailModal" class="modal detail-modal"><div id="detailBody"></div></dialog>
+  <script src="/app.js"></script>
+</body>
+</html>
