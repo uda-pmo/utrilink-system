@@ -13,3 +13,4 @@ JWT_SECRET="a-long-random-production-secret" npm start
 
 部署时设置强随机 `JWT_SECRET`，以 HTTPS 反向代理运行，并将 `nutrilink.db` 与 `uploads/` 挂载为持久卷。数据库文件与上传目录含业务数据，不应提交到 Git。
 Railway deployment trigger
+Supabase runtime configuration enabled.
