@@ -5,6 +5,7 @@
   "engines": { "node": ">=22" },
   "scripts": { "start": "node server.js", "dev": "node --watch server.js" },
   "dependencies": {
+    "@supabase/supabase-js": "^2.49.1",
     "bcryptjs": "^2.4.3",
     "express": "^4.21.2",
     "jsonwebtoken": "^9.0.2",
