@@ -1,52 +1,45 @@
 const path = require('path');
-const fs = require('fs');
 const crypto = require('crypto');
 const express = require('express');
-const { DatabaseSync } = require('node:sqlite');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const multer = require('multer');
+const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const SECRET = process.env.JWT_SECRET || 'change-this-secret-before-production';
-const root = __dirname;
-const dataDir = process.env.DATA_DIR || root;
-fs.mkdirSync(dataDir, { recursive: true });
-const uploadDir = path.join(dataDir, 'uploads');
-fs.mkdirSync(uploadDir, { recursive: true });
-const db = new DatabaseSync(path.join(dataDir, 'nutrilink.db'));
-db.exec('PRAGMA journal_mode = WAL');
-db.exec(`CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, email TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'brand', created_at TEXT DEFAULT CURRENT_TIMESTAMP);
-CREATE TABLE IF NOT EXISTS orders (id INTEGER PRIMARY KEY, contract_no TEXT UNIQUE NOT NULL, factory_name TEXT NOT NULL, batch_no TEXT, sku TEXT NOT NULL, node TEXT, due_date TEXT, quantity TEXT, formula TEXT, formula_version TEXT, pack_spec TEXT, production_date TEXT, shelf_life TEXT, expiry_date TEXT, progress INTEGER DEFAULT 0, status TEXT DEFAULT '待确认', created_at TEXT DEFAULT CURRENT_TIMESTAMP, updated_at TEXT DEFAULT CURRENT_TIMESTAMP);
-CREATE TABLE IF NOT EXISTS files (id INTEGER PRIMARY KEY, order_id INTEGER NOT NULL, original_name TEXT NOT NULL, stored_name TEXT NOT NULL, mime_type TEXT, size INTEGER, created_at TEXT DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY(order_id) REFERENCES orders(id));`);
+const SECRET = process.env.JWT_SECRET;
+const url = process.env.SUPABASE_URL;
+const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+if (!SECRET || !url || !serviceKey) throw new Error('JWT_SECRET, SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required.');
+const supabase = createClient(url, serviceKey, { auth: { persistSession: false, autoRefreshToken: false } });
+const auth = (req, res, next) => { try { req.user = jwt.verify((req.headers.authorization || '').replace(/^Bearer\s+/i, ''), SECRET); next(); } catch { res.status(401).json({ error: '登录已失效，请重新登录。' }); } };
+const safeUser = u => ({ id: u.id, name: u.name, email: u.email, role: u.role });
+const fail = (res, error, fallback = '操作失败。') => res.status(500).json({ error: error?.message || fallback });
+const columns = ['contract_no','factory_name','batch_no','sku','node','due_date','quantity','formula','formula_version','pack_spec','production_date','shelf_life','expiry_date','progress','status'];
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
 
 app.use(express.json());
-app.use(express.static(path.join(root, 'public')));
-const auth = (req, res, next) => {
-  const token = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
-  try { req.user = jwt.verify(token, SECRET); next(); } catch { res.status(401).json({ error: '登录已失效，请重新登录。' }); }
-};
-const safeUser = user => ({ id: user.id, name: user.name, email: user.email, role: user.role });
+app.use(express.static(path.join(__dirname, 'public')));
 app.post('/api/auth/register', async (req, res) => {
   const { name, email, password } = req.body;
   if (!name || !email || !password || password.length < 8) return res.status(400).json({ error: '请填写姓名、邮箱和至少 8 位密码。' });
-  try { const result = db.prepare('INSERT INTO users (name,email,password_hash) VALUES (?,?,?)').run(name.trim(), email.trim().toLowerCase(), await bcrypt.hash(password, 12)); const user = db.prepare('SELECT * FROM users WHERE id=?').get(result.lastInsertRowid); res.status(201).json({ token: jwt.sign(safeUser(user), SECRET, { expiresIn: '8h' }), user: safeUser(user) }); } catch { res.status(409).json({ error: '该邮箱已注册。' }); }
+  const { data: exists, error: findError } = await supabase.from('nl_users').select('id').eq('email', email.trim().toLowerCase()).maybeSingle();
+  if (findError) return fail(res, findError); if (exists) return res.status(409).json({ error: '该邮箱已注册。' });
+  const { data: user, error } = await supabase.from('nl_users').insert({ name: name.trim(), email: email.trim().toLowerCase(), password_hash: await bcrypt.hash(password, 12) }).select().single();
+  if (error) return fail(res, error); res.status(201).json({ token: jwt.sign(safeUser(user), SECRET, { expiresIn: '8h' }), user: safeUser(user) });
 });
 app.post('/api/auth/login', async (req, res) => {
-  const user = db.prepare('SELECT * FROM users WHERE email=?').get((req.body.email || '').trim().toLowerCase());
-  if (!user || !(await bcrypt.compare(req.body.password || '', user.password_hash))) return res.status(401).json({ error: '邮箱或密码不正确。' });
+  const { data: user, error } = await supabase.from('nl_users').select('*').eq('email', (req.body.email || '').trim().toLowerCase()).maybeSingle();
+  if (error) return fail(res, error); if (!user || !(await bcrypt.compare(req.body.password || '', user.password_hash))) return res.status(401).json({ error: '邮箱或密码不正确。' });
   res.json({ token: jwt.sign(safeUser(user), SECRET, { expiresIn: '8h' }), user: safeUser(user) });
 });
 app.get('/api/auth/me', auth, (req, res) => res.json({ user: req.user }));
-app.get('/api/orders', auth, (req, res) => res.json(db.prepare('SELECT * FROM orders ORDER BY updated_at DESC, id DESC').all()));
-app.get('/api/orders/:id', auth, (req, res) => { const order = db.prepare('SELECT * FROM orders WHERE id=?').get(req.params.id); if (!order) return res.sendStatus(404); order.files = db.prepare('SELECT id,original_name,mime_type,size,created_at FROM files WHERE order_id=? ORDER BY id DESC').all(order.id); res.json(order); });
-const columns = ['contract_no','factory_name','batch_no','sku','node','due_date','quantity','formula','formula_version','pack_spec','production_date','shelf_life','expiry_date','progress','status'];
-app.post('/api/orders', auth, (req, res) => { const data = columns.map(c => req.body[c] ?? (c === 'progress' ? 0 : '')); if (!data[0] || !data[1] || !data[3]) return res.status(400).json({ error: '合同号、工厂名称和 SKU 为必填项。' }); try { const stmt = db.prepare(`INSERT INTO orders (${columns.join(',')}) VALUES (${columns.map(() => '?').join(',')})`); const result = stmt.run(...data); res.status(201).json(db.prepare('SELECT * FROM orders WHERE id=?').get(result.lastInsertRowid)); } catch { res.status(409).json({ error: '合同号已存在。' }); } });
-app.put('/api/orders/:id', auth, (req, res) => { const existing = db.prepare('SELECT id FROM orders WHERE id=?').get(req.params.id); if (!existing) return res.sendStatus(404); const data = columns.map(c => req.body[c] ?? ''); if (!data[0] || !data[1] || !data[3]) return res.status(400).json({ error: '合同号、工厂名称和 SKU 为必填项。' }); try { db.prepare(`UPDATE orders SET ${columns.map(c => `${c}=?`).join(',')}, updated_at=CURRENT_TIMESTAMP WHERE id=?`).run(...data, req.params.id); res.json(db.prepare('SELECT * FROM orders WHERE id=?').get(req.params.id)); } catch { res.status(409).json({ error: '合同号已存在。' }); } });
-const storage = multer.diskStorage({ destination: uploadDir, filename: (req, file, cb) => cb(null, `${crypto.randomUUID()}${path.extname(file.originalname)}`) });
-const upload = multer({ storage, limits: { fileSize: 20 * 1024 * 1024 } });
-app.post('/api/orders/:id/files', auth, upload.single('file'), (req, res) => { if (!req.file) return res.status(400).json({ error: '请选择文件。' }); const order = db.prepare('SELECT id FROM orders WHERE id=?').get(req.params.id); if (!order) { fs.unlinkSync(req.file.path); return res.sendStatus(404); } const result = db.prepare('INSERT INTO files (order_id,original_name,stored_name,mime_type,size) VALUES (?,?,?,?,?)').run(order.id, req.file.originalname, req.file.filename, req.file.mimetype, req.file.size); res.status(201).json(db.prepare('SELECT id,original_name,mime_type,size,created_at FROM files WHERE id=?').get(result.lastInsertRowid)); });
-app.get('/api/files/:id', auth, (req, res) => { const file = db.prepare('SELECT * FROM files WHERE id=?').get(req.params.id); if (!file) return res.sendStatus(404); res.type(file.mime_type || 'application/octet-stream').sendFile(path.join(uploadDir, file.stored_name)); });
-app.delete('/api/files/:id', auth, (req, res) => { const file = db.prepare('SELECT * FROM files WHERE id=?').get(req.params.id); if (!file) return res.sendStatus(404); db.prepare('DELETE FROM files WHERE id=?').run(file.id); fs.rmSync(path.join(uploadDir, file.stored_name), { force: true }); res.sendStatus(204); });
-app.listen(PORT, () => console.log(`NutriLink running at http://localhost:${PORT}`));
+app.get('/api/orders', auth, async (req, res) => { const { data, error } = await supabase.from('nl_orders').select('*').order('updated_at', { ascending: false }); if (error) return fail(res, error); res.json(data); });
+app.get('/api/orders/:id', auth, async (req, res) => { const { data: order, error } = await supabase.from('nl_orders').select('*').eq('id', req.params.id).maybeSingle(); if (error) return fail(res, error); if (!order) return res.sendStatus(404); const { data: files, error: fileError } = await supabase.from('nl_files').select('id,original_name,mime_type,size,created_at').eq('order_id', order.id).order('id', { ascending: false }); if (fileError) return fail(res, fileError); res.json({ ...order, files }); });
+app.post('/api/orders', auth, async (req, res) => { const record = Object.fromEntries(columns.map(c => [c, req.body[c] ?? (c === 'progress' ? 0 : null)])); if (!record.contract_no || !record.factory_name || !record.sku) return res.status(400).json({ error: '合同号、工厂名称和 SKU 为必填项。' }); const { data, error } = await supabase.from('nl_orders').insert(record).select().single(); if (error) return res.status(error.code === '23505' ? 409 : 500).json({ error: error.code === '23505' ? '合同号已存在。' : error.message }); res.status(201).json(data); });
+app.put('/api/orders/:id', auth, async (req, res) => { const record = Object.fromEntries(columns.map(c => [c, req.body[c] ?? (c === 'progress' ? 0 : null)])); if (!record.contract_no || !record.factory_name || !record.sku) return res.status(400).json({ error: '合同号、工厂名称和 SKU 为必填项。' }); record.updated_at = new Date().toISOString(); const { data, error } = await supabase.from('nl_orders').update(record).eq('id', req.params.id).select().maybeSingle(); if (error) return res.status(error.code === '23505' ? 409 : 500).json({ error: error.code === '23505' ? '合同号已存在。' : error.message }); if (!data) return res.sendStatus(404); res.json(data); });
+app.post('/api/orders/:id/files', auth, upload.single('file'), async (req, res) => { if (!req.file) return res.status(400).json({ error: '请选择文件。' }); const { data: order, error: orderError } = await supabase.from('nl_orders').select('id').eq('id', req.params.id).maybeSingle(); if (orderError) return fail(res, orderError); if (!order) return res.sendStatus(404); const storagePath = `${order.id}/${crypto.randomUUID()}${path.extname(req.file.originalname)}`; const { error: uploadError } = await supabase.storage.from('nutrilink-files').upload(storagePath, req.file.buffer, { contentType: req.file.mimetype, upsert: false }); if (uploadError) return fail(res, uploadError); const { data, error } = await supabase.from('nl_files').insert({ order_id: order.id, original_name: req.file.originalname, storage_path: storagePath, mime_type: req.file.mimetype, size: req.file.size }).select('id,original_name,mime_type,size,created_at').single(); if (error) { await supabase.storage.from('nutrilink-files').remove([storagePath]); return fail(res, error); } res.status(201).json(data); });
+app.get('/api/files/:id', auth, async (req, res) => { const { data: file, error } = await supabase.from('nl_files').select('*').eq('id', req.params.id).maybeSingle(); if (error) return fail(res, error); if (!file) return res.sendStatus(404); const { data, error: downloadError } = await supabase.storage.from('nutrilink-files').download(file.storage_path); if (downloadError) return fail(res, downloadError); res.type(file.mime_type || 'application/octet-stream').send(Buffer.from(await data.arrayBuffer())); });
+app.delete('/api/files/:id', auth, async (req, res) => { const { data: file, error } = await supabase.from('nl_files').select('*').eq('id', req.params.id).maybeSingle(); if (error) return fail(res, error); if (!file) return res.sendStatus(404); const { error: storageError } = await supabase.storage.from('nutrilink-files').remove([file.storage_path]); if (storageError) return fail(res, storageError); const { error: deleteError } = await supabase.from('nl_files').delete().eq('id', file.id); if (deleteError) return fail(res, deleteError); res.sendStatus(204); });
+app.listen(PORT, () => console.log(`NutriLink running on ${PORT}`));
