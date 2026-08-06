@@ -59,14 +59,30 @@ let previewUrl = null;
 const clearFilePreview = () => { $('#filePreviewFrame').removeAttribute('src'); if (previewUrl) URL.revokeObjectURL(previewUrl); previewUrl = null; };
 window.closeFilePreview = () => { const modal = $('#filePreviewModal'); if (modal.open) modal.close(); };
 $('#filePreviewModal').addEventListener('close', clearFilePreview);
-window.previewFile = async id => { try { clearFilePreview(); $('#filePreviewMeta').textContent = '正在加载文件'; $('#filePreviewModal').showModal(); previewUrl = URL.createObjectURL(await getFile(id)); $('#filePreviewFrame').src = previewUrl; $('#filePreviewMeta').textContent = '文件已加载，可关闭后返回订单详情'; } catch (error) { closeFilePreview(); alert(error.message); } };
+$('#filePreviewModal').addEventListener('cancel', clearFilePreview);
+$('#filePreviewFrame').addEventListener('load', () => { if ($('#filePreviewModal').open) $('#filePreviewMeta').textContent = '文件已加载，可关闭后返回订单详情'; });
+window.previewFile = async id => { try { clearFilePreview(); $('#filePreviewMeta').textContent = '正在加载文件'; $('#filePreviewModal').showModal(); previewUrl = URL.createObjectURL(await getFile(id)); $('#filePreviewFrame').src = previewUrl; } catch (error) { $('#filePreviewMeta').textContent = '文件加载失败'; closeFilePreview(); alert(error.message); } };
 window.downloadFile = async (id, name) => { try { const link = document.createElement('a'); link.href = URL.createObjectURL(await getFile(id)); link.download = name; link.click(); setTimeout(() => URL.revokeObjectURL(link.href), 1000); } catch (error) { alert(error.message); } };
 window.deleteFile = async (id, orderId) => { if (!confirm('确认删除这个文件？')) return; try { await api(`/api/files/${id}`, { method: 'DELETE' }); await loadData(); openDetail(orderId); } catch (error) { alert(error.message); } };
 $('#export').onclick = () => { const source = view === 'documents' ? files.map(file => { const order = orderById(file.order_id) || {}; return [file.original_name, order.contract_no || '', order.product_name || '', file.mime_type || '', date(file.created_at)]; }) : orders.map(order => [order.product_name, order.contract_no, order.factory_name, order.sku, order.node, `${order.progress || 0}%`, date(order.due_date), order.status]); const header = view === 'documents' ? ['文件名', '合同号', '产品名称', '文件类型', '上传时间'] : ['产品名称', '合同号', '工厂名称', 'SKU', '当前节点', '进度', '交期', '状态']; const csv = [header, ...source].map(row => row.map(value => `"${String(value ?? '').replaceAll('"', '""')}"`).join(',')).join('\n'); const link = document.createElement('a'); link.href = URL.createObjectURL(new Blob(['\ufeff' + csv], { type: 'text/csv;charset=utf-8' })); link.download = `NutriLink_${view}.csv`; link.click(); URL.revokeObjectURL(link.href); };
 document.querySelectorAll('.nav').forEach(button => button.onclick = () => showView(button.dataset.view));
 $('#newOrder').onclick = openOrderForm;
-$('#logout').onclick = () => { localStorage.removeItem('token'); location.reload(); };
+$('#logout').onclick = () => {
+  // A modal dialog lives in the browser's top layer, so close it before hiding the app.
+  closeFilePreview();
+  clearFilePreview();
+  localStorage.removeItem('token');
+  location.reload();
+};
 async function signIn(register) { const data = Object.fromEntries(new FormData($('#authForm'))); try { const result = await api(register ? '/api/auth/register' : '/api/auth/login', { method: 'POST', body: JSON.stringify(data) }); localStorage.token = result.token; await start(result.user); } catch (error) { $('#authError').textContent = error.message; } }
 async function start(currentUser) { user = currentUser; $('#auth').hidden = true; $('#app').hidden = false; $('#who').textContent = user.name; $('#role').textContent = user.role === 'factory' ? 'Factory' : 'Brand Operations'; await loadData(); render(); }
 $('#authForm').onsubmit = event => { event.preventDefault(); signIn(false); }; $('#register').onclick = () => signIn(true);
-(async () => { if (!localStorage.token) return; try { await start((await api('/api/auth/me')).user); } catch { localStorage.removeItem('token'); } })();
+(async () => {
+  if (!localStorage.token) {
+    closeFilePreview();
+    clearFilePreview();
+    return;
+  }
+  try { await start((await api('/api/auth/me')).user); }
+  catch { closeFilePreview(); clearFilePreview(); localStorage.removeItem('token'); }
+})();
