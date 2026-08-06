@@ -46,7 +46,7 @@
 
   <dialog id="orderModal" class="modal"><form id="orderForm"></form></dialog>
   <dialog id="detailModal" class="modal detail-modal"><div id="detailBody"></div></dialog>
-  <dialog id="filePreviewModal" class="modal preview-modal"><div class="preview-modal-head"><div><h2 id="filePreviewTitle">文件预览</h2><p id="filePreviewMeta">正在加载文件</p></div><form method="dialog"><button class="preview-close" title="关闭预览" aria-label="关闭预览">×</button></form></div><iframe id="filePreviewFrame" title="文件预览"></iframe></dialog>
+  <div id="filePreviewModal" class="modal preview-modal" hidden role="dialog" aria-modal="true" aria-labelledby="filePreviewTitle"><div class="preview-modal-head"><div><h2 id="filePreviewTitle">文件预览</h2><p id="filePreviewMeta">正在加载文件</p></div><button type="button" class="preview-close" title="关闭预览" aria-label="关闭预览" onclick="closeFilePreview()">×</button></div><iframe id="filePreviewFrame" title="文件预览"></iframe></div>
   <script src="/app.js"></script>
 </body>
 </html>
