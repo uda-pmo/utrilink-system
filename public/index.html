@@ -16,6 +16,8 @@
       <label>姓名（首次注册）<input name="name" placeholder="林雨"></label>
       <label>工作邮箱<input name="email" type="email" required placeholder="you@company.com"></label>
       <label>密码<input name="password" type="password" required minlength="8" placeholder="至少 8 位"></label>
+      <label>账号类型<select name="role"><option value="brand">品牌方</option><option value="factory">工厂</option></select></label>
+      <label>工厂名称（工厂账号必填）<input name="factory_name" placeholder="例如：NOVAREX"></label>
       <button type="submit" class="primary">登录</button>
       <button type="button" id="register" class="secondary">创建账号</button>
       <small id="authError"></small>
