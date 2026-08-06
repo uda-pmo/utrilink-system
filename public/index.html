@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>NutriLink | 代工协同中心</title>
   <link rel="stylesheet" href="/styles.css">
+  <link rel="stylesheet" href="/order-detail.css">
 </head>
 <body>
   <section id="auth" class="auth">
@@ -38,7 +39,7 @@
     <main>
       <header class="topbar">
         <div><b id="crumb">工作看板</b><span id="subtitle">实时追踪跨境代工订单与合规文件状态</span></div>
-        <div class="header-actions"><button id="export" class="outline" title="导出当前列表">导出</button><button id="newOrder" class="primary">+ 新建代工订单</button></div>
+        <div class="header-actions"><select id="language" class="language-select" aria-label="Language"><option value="zh">中文</option><option value="en">English</option><option value="ko">한국어</option></select><button id="export" class="outline" title="导出当前列表">导出</button><button id="newOrder" class="primary">+ 新建代工订单</button></div>
       </header>
       <section id="content"></section>
     </main>
