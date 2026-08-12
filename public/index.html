@@ -34,6 +34,8 @@
         <button class="nav" data-view="orders">代工订单</button>
         <button class="nav" data-view="documents">文档归档</button>
         <button class="nav" data-view="factories">互联工厂</button>
+        <button class="nav" data-view="quotes">报价与成本</button>
+        <button class="nav" data-view="risks">风险看板</button>
       </nav>
       <div class="account"><b id="who"></b><small id="role"></small><button id="logout">退出登录</button></div>
     </aside>
@@ -48,6 +50,8 @@
 
   <dialog id="orderModal" class="modal"><form id="orderForm"></form></dialog>
   <dialog id="detailModal" class="modal detail-modal"><div id="detailBody"></div></dialog>
+  <dialog id="reviewModal" class="modal"><form id="reviewForm"></form></dialog>
+  <dialog id="quoteModal" class="modal"><form id="quoteForm"></form></dialog>
   <div id="filePreviewModal" class="modal preview-modal" hidden role="dialog" aria-modal="true" aria-labelledby="filePreviewTitle"><div class="preview-modal-head"><div><h2 id="filePreviewTitle">文件预览</h2><p id="filePreviewMeta">正在加载文件</p></div><button type="button" class="preview-close" title="关闭预览" aria-label="关闭预览" onclick="closeFilePreview()">×</button></div><iframe id="filePreviewFrame" title="文件预览"></iframe></div>
   <script src="/app.js"></script>
 </body>
