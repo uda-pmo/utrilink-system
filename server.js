@@ -11,6 +11,8 @@ const PORT = process.env.PORT || 3000;
 const SECRET = process.env.JWT_SECRET;
 const url = process.env.SUPABASE_URL;
 const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const resendApiKey = process.env.RESEND_API_KEY;
+const reminderEmailFrom = process.env.REMINDER_EMAIL_FROM;
 if (!SECRET || !url || !serviceKey) throw new Error('JWT_SECRET, SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required.');
 const supabase = createClient(url, serviceKey, { auth: { persistSession: false, autoRefreshToken: false } });
 const auth = (req, res, next) => { try { req.user = jwt.verify((req.headers.authorization || '').replace(/^Bearer\s+/i, ''), SECRET); next(); } catch { res.status(401).json({ error: '登录已失效，请重新登录。' }); } };
@@ -24,6 +26,27 @@ const displayValue = value => value === null || value === undefined || value ===
 const changedFields = (before, after, fields) => fields.filter(field => String(before[field] ?? '') !== String(after[field] ?? '')).map(field => `${productInfoLabels[field] || field}：${displayValue(before[field])} -> ${displayValue(after[field])}`);
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
 const isFactory = user => user.role === 'factory';
+const visibleContact = (contact, currentUser) => contact.email && contact.email !== currentUser.email && contact.name !== '系统维护' && !contact.email.endsWith('@nutrilink.local');
+const reminderContacts = async (user, order) => {
+  let query = supabase.from('nl_users').select('id,name,email,role,factory_name').order('name');
+  query = isFactory(user) ? query.eq('role', 'brand') : query.eq('role', 'factory').eq('factory_name', order.factory_name);
+  const { data, error } = await query;
+  return { contacts: (data || []).filter(contact => visibleContact(contact, user)), error };
+};
+const sendReminderEmail = async ({ recipients, subject, text }) => {
+  if (!resendApiKey || !reminderEmailFrom) return { sent: false, reason: '邮件服务尚未配置' };
+  try {
+    const response = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${resendApiKey}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from: reminderEmailFrom, to: recipients, subject, text })
+    });
+    if (!response.ok) return { sent: false, reason: '邮件服务返回发送失败' };
+    return { sent: true };
+  } catch {
+    return { sent: false, reason: '邮件服务暂时不可用' };
+  }
+};
 const activity = async ({ orderId, action, detail, actor, targetRole, fileId = null }) => {
   const { error } = await supabase.from('nl_activity').insert({ order_id: orderId, action, detail, actor_name: actor.name, actor_role: actor.role, target_role: targetRole, file_id: fileId });
   return error;
@@ -95,6 +118,12 @@ app.get('/api/orders/:id', auth, async (req, res) => {
   if (error) return fail(res, error);
   res.json({ ...order, files: filesResult.data, actions: actionsResult.data, milestones: milestonesResult.data, comments: commentsResult.data });
 });
+app.get('/api/orders/:id/contacts', auth, async (req, res) => {
+  const order = await orderAccess(req, res, req.params.id); if (!order) return;
+  const { contacts, error } = await reminderContacts(req.user, order);
+  if (error) return fail(res, error);
+  res.json(contacts);
+});
 app.get('/api/files', auth, async (req, res) => { const { data, error } = await supabase.from('nl_files').select('id,order_id,original_name,document_type,mime_type,size,created_at,uploaded_by_name,uploaded_by_role,review_status,review_note,reviewed_by_name,reviewed_at').order('id', { ascending: false }); if (error) return fail(res, error); if (!isFactory(req.user)) return res.json(data); const { ids, error: orderError } = await factoryOrderIds(req.user.factory_name); if (orderError) return fail(res, orderError); res.json(data.filter(file => ids.has(file.order_id))); });
 app.get('/api/activity', auth, async (req, res) => { const { data, error } = await supabase.from('nl_activity').select('*').order('created_at', { ascending: false }).limit(80); if (error) return fail(res, error); if (!isFactory(req.user)) return res.json(data.filter(item => !item.target_role || item.target_role === req.user.role || item.actor_role === req.user.role)); const { ids, error: orderError } = await factoryOrderIds(req.user.factory_name); if (orderError) return fail(res, orderError); res.json(data.filter(item => ids.has(item.order_id) && (!item.target_role || item.target_role === req.user.role || item.actor_role === req.user.role))); });
 app.get('/api/notifications', auth, async (req, res) => { let query = supabase.from('nl_notifications').select('*').order('created_at', { ascending: false }).limit(100); const { data, error } = await query; if (error) return fail(res, error); if (!isFactory(req.user)) return res.json(data.filter(item => !item.target_role || item.target_role === req.user.role)); const { ids, error: orderError } = await factoryOrderIds(req.user.factory_name); if (orderError) return fail(res, orderError); res.json(data.filter(item => ids.has(item.order_id) && (!item.target_role || item.target_role === 'factory'))); });
@@ -142,7 +171,23 @@ app.put('/api/orders/:id/milestones/:milestoneId', auth, async (req, res) => {
   await activity({ orderId: order.id, action: `更新里程碑：${milestone.node_name}`, detail: `${milestone.status || (complete ? '已完成' : '进行中')}${milestone.delay_reason ? ` · 延期原因：${milestone.delay_reason}` : ''}`, actor: req.user, targetRole: isFactory(req.user) ? 'brand' : 'factory' });
   res.json(milestone);
 });
-app.post('/api/orders/:id/reminders', auth, async (req, res) => { const order = await orderAccess(req, res, req.params.id); if (!order) return; const targetRole = isFactory(req.user) ? 'brand' : 'factory'; const context = String(req.body.context || '').trim(); const message = String(req.body.message || '').trim() || `请反馈 ${order.product_name}${context ? `的${context}` : ''}。`; const { data, error } = await supabase.from('nl_reminders').insert({ order_id: order.id, message, created_by_name: req.user.name, created_by_role: req.user.role, target_role: targetRole }).select().single(); if (error) return fail(res, error); await activity({ orderId: order.id, action: isFactory(req.user) ? '提醒品牌方' : '提醒工厂', detail: message, actor: req.user, targetRole }); await notify({ orderId: order.id, kind: '协作提醒', title: isFactory(req.user) ? '工厂请求反馈' : '请处理订单协作事项', detail: message, targetRole, actor: req.user }); res.status(201).json(data); });
+app.post('/api/orders/:id/reminders', auth, async (req, res) => {
+  const order = await orderAccess(req, res, req.params.id); if (!order) return;
+  const targetRole = isFactory(req.user) ? 'brand' : 'factory';
+  const context = String(req.body.context || '').trim();
+  const message = String(req.body.message || '').trim() || `请反馈 ${order.product_name}${context ? `的${context}` : ''}。`;
+  const { contacts, error: contactError } = await reminderContacts(req.user, order);
+  if (contactError) return fail(res, contactError);
+  const allowedEmails = new Set(contacts.map(contact => contact.email));
+  const requestedEmails = Array.isArray(req.body.recipients) ? req.body.recipients.map(value => String(value).trim().toLowerCase()) : [];
+  const recipients = requestedEmails.filter(email => allowedEmails.has(email));
+  const { data, error } = await supabase.from('nl_reminders').insert({ order_id: order.id, message, created_by_name: req.user.name, created_by_role: req.user.role, target_role: targetRole }).select().single();
+  if (error) return fail(res, error);
+  const email = recipients.length ? await sendReminderEmail({ recipients, subject: `NutriLink 提醒：${order.product_name}${context ? ` - ${context}` : ''}`, text: `${message}\n\n订单：${order.product_name}\n工厂：${order.factory_name}\n\n请登录 NutriLink 查看详情。` }) : { sent: false, reason: '未选择收件人' };
+  await activity({ orderId: order.id, action: isFactory(req.user) ? '提醒品牌方' : '提醒工厂', detail: `${message}${email.sent ? ' · 邮件已发送' : recipients.length ? ` · 邮件未发送：${email.reason}` : ''}`, actor: req.user, targetRole });
+  await notify({ orderId: order.id, kind: '协作提醒', title: isFactory(req.user) ? '工厂请求反馈' : '请处理订单协作事项', detail: message, targetRole, actor: req.user });
+  res.status(201).json({ ...data, email });
+});
 app.get('/api/reminders', auth, async (req, res) => { const { data, error } = await supabase.from('nl_reminders').select('*').order('created_at', { ascending: false }).limit(100); if (error) return fail(res, error); if (!isFactory(req.user)) return res.json(data); const { ids, error: orderError } = await factoryOrderIds(req.user.factory_name); if (orderError) return fail(res, orderError); res.json(data.filter(item => ids.has(item.order_id))); });
 app.post('/api/reminders/:id/read', auth, async (req, res) => { const { data: reminder, error: findError } = await supabase.from('nl_reminders').select('*,nl_orders(factory_name)').eq('id', req.params.id).maybeSingle(); if (findError) return fail(res, findError); if (!reminder) return res.sendStatus(404); if (isFactory(req.user) && reminder.nl_orders?.factory_name !== req.user.factory_name) return res.sendStatus(403); const { data, error } = await supabase.from('nl_reminders').update({ read_at: new Date().toISOString(), read_by_name: req.user.name }).eq('id', reminder.id).select().single(); if (error) return fail(res, error); res.json(data); });
 app.post('/api/orders/:id/comments', auth, async (req, res) => { const order = await orderAccess(req, res, req.params.id); if (!order) return; const message = String(req.body.message || '').trim(); const mentions = Array.isArray(req.body.mentions) ? req.body.mentions.join(', ') : String(req.body.mentions || ''); if (!message) return res.status(400).json({ error: '请输入评论内容。' }); const { data, error } = await supabase.from('nl_comments').insert({ order_id: order.id, message, mentions, created_by_name: req.user.name, created_by_role: req.user.role }).select().single(); if (error) return fail(res, error); await activity({ orderId: order.id, action: '添加协作评论', detail: message, actor: req.user, targetRole: isFactory(req.user) ? 'brand' : 'factory' }); if (mentions) await notify({ orderId: order.id, kind: '评论提及', title: `${req.user.name} 在订单中提及您`, detail: message, targetRole: isFactory(req.user) ? 'brand' : 'factory', actor: req.user }); res.status(201).json(data); });
