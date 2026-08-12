@@ -76,3 +76,11 @@ create table if not exists public.nl_quotes (
 );
 create index if not exists nl_quotes_product_date_idx on public.nl_quotes(product_name, quoted_at);
 create index if not exists nl_quotes_factory_product_idx on public.nl_quotes(factory_name, product_name);
+
+-- This application accesses these tables only through the Railway service role.
+-- Keep direct browser access closed.
+alter table public.nl_milestones enable row level security;
+alter table public.nl_reminders enable row level security;
+alter table public.nl_notifications enable row level security;
+alter table public.nl_comments enable row level security;
+alter table public.nl_quotes enable row level security;
