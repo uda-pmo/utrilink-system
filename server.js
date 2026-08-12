@@ -136,6 +136,12 @@ app.post('/api/quotes', auth, async (req, res) => { if (isFactory(req.user)) ret
   if (!payload.product_name || !payload.factory_name || !Number.isFinite(payload.unit_price)) return res.status(400).json({ error: '产品、工厂和单价为必填项。' });
   const { data, error } = await supabase.from('nl_quotes').insert(payload).select().single(); if (error) return fail(res, error); res.status(201).json(data);
 });
+app.delete('/api/quotes/:id', auth, async (req, res) => {
+  if (isFactory(req.user)) return res.sendStatus(403);
+  const { error } = await supabase.from('nl_quotes').delete().eq('id', req.params.id);
+  if (error) return fail(res, error);
+  res.sendStatus(204);
+});
 app.get('/api/files/:id', auth, async (req, res) => { const { data: file, error } = await supabase.from('nl_files').select('*').eq('id', req.params.id).maybeSingle(); if (error) return fail(res, error); if (!file) return res.sendStatus(404); const { allowed, error: accessError } = await canAccessFile(req.user, file); if (accessError) return fail(res, accessError); if (!allowed) return res.sendStatus(403); const { data, error: downloadError } = await supabase.storage.from('nutrilink-files').download(file.storage_path); if (downloadError) return fail(res, downloadError); res.type(file.mime_type || 'application/octet-stream').send(Buffer.from(await data.arrayBuffer())); });
 app.delete('/api/files/:id', auth, async (req, res) => { const { data: file, error } = await supabase.from('nl_files').select('*').eq('id', req.params.id).maybeSingle(); if (error) return fail(res, error); if (!file) return res.sendStatus(404); const { allowed, error: accessError } = await canAccessFile(req.user, file); if (accessError) return fail(res, accessError); if (!allowed || (isFactory(req.user) && file.uploaded_by_name !== req.user.name)) return res.sendStatus(403); const { error: storageError } = await supabase.storage.from('nutrilink-files').remove([file.storage_path]); if (storageError) return fail(res, storageError); const { error: deleteError } = await supabase.from('nl_files').delete().eq('id', file.id); if (deleteError) return fail(res, deleteError); res.sendStatus(204); });
 app.listen(PORT, () => console.log(`NutriLink running on ${PORT}`));
