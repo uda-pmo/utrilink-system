@@ -6,13 +6,11 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const multer = require('multer');
 const XLSX = require('xlsx');
-const { WebSocketServer } = require('ws');
 const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
 const httpServer = http.createServer(app);
-const notificationSockets = new Set();
-const wsServer = new WebSocketServer({ noServer: true });
+const notificationStreams = new Set();
 const PORT = process.env.PORT || 3000;
 const SECRET = process.env.JWT_SECRET;
 const url = process.env.SUPABASE_URL;
@@ -79,9 +77,9 @@ const canAccessFile = async (user, file) => {
 const canAccessOrder = (user, order) => !isFactory(user) || order.factory_name === user.factory_name;
 const getOrder = async id => supabase.from('nl_orders').select('*').eq('id', id).maybeSingle();
 const broadcastNotification = notification => {
-  const message = JSON.stringify({ type: 'notification', notification });
-  notificationSockets.forEach(socket => {
-    if (socket.readyState === 1 && (!notification.target_role || socket.user?.role === notification.target_role)) socket.send(message);
+  const message = `event: notification\ndata: ${JSON.stringify(notification)}\n\n`;
+  notificationStreams.forEach(stream => {
+    if (!notification.target_role || stream.user?.role === notification.target_role) stream.res.write(message);
   });
 };
 const notify = async ({ orderId, kind = '系统消息', title, detail = '', targetRole, actor }) => {
@@ -160,6 +158,17 @@ app.get('/api/orders/:id/contacts', auth, async (req, res) => {
 app.get('/api/files', auth, async (req, res) => { const { data, error } = await supabase.from('nl_files').select('id,order_id,original_name,document_type,mime_type,size,created_at,uploaded_by_name,uploaded_by_role,review_status,review_note,reviewed_by_name,reviewed_at').order('id', { ascending: false }); if (error) return fail(res, error); if (!isFactory(req.user)) return res.json(data.map(publicFile)); const { ids, error: orderError } = await factoryOrderIds(req.user.factory_name); if (orderError) return fail(res, orderError); res.json(data.filter(file => ids.has(file.order_id)).map(publicFile)); });
 app.get('/api/activity', auth, async (req, res) => { const { data, error } = await supabase.from('nl_activity').select('*').order('created_at', { ascending: false }).limit(80); if (error) return fail(res, error); if (!isFactory(req.user)) return res.json(data.filter(item => !item.target_role || item.target_role === req.user.role || item.actor_role === req.user.role)); const { ids, error: orderError } = await factoryOrderIds(req.user.factory_name); if (orderError) return fail(res, orderError); res.json(data.filter(item => ids.has(item.order_id) && (!item.target_role || item.target_role === req.user.role || item.actor_role === req.user.role))); });
 app.get('/api/notifications', auth, async (req, res) => { let query = supabase.from('nl_notifications').select('*').order('created_at', { ascending: false }).limit(100); const { data, error } = await query; if (error) return fail(res, error); if (!isFactory(req.user)) return res.json(data.filter(item => !item.target_role || item.target_role === req.user.role)); const { ids, error: orderError } = await factoryOrderIds(req.user.factory_name); if (orderError) return fail(res, orderError); res.json(data.filter(item => ids.has(item.order_id) && (!item.target_role || item.target_role === 'factory'))); });
+app.get('/api/notifications/stream', (req, res) => {
+  try {
+    const user = jwt.verify(String(req.query.token || ''), SECRET);
+    const stream = { user, res };
+    res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache, no-transform', Connection: 'keep-alive' });
+    res.write('event: ready\ndata: {}\n\n');
+    notificationStreams.add(stream);
+    const keepAlive = setInterval(() => res.write(': keepalive\n\n'), 25000);
+    req.on('close', () => { clearInterval(keepAlive); notificationStreams.delete(stream); });
+  } catch { res.sendStatus(401); }
+});
 app.post('/api/notifications/:id/read', auth, async (req, res) => { const { data, error } = await supabase.from('nl_notifications').update({ read_at: new Date().toISOString(), read_by_name: req.user.name }).eq('id', req.params.id).select().maybeSingle(); if (error) return fail(res, error); if (!data) return res.sendStatus(404); res.json(data); });
 app.delete('/api/activity/:id', auth, async (req, res) => {
   if (isFactory(req.user)) return res.status(403).json({ error: '仅品牌方管理员可以删除系统记录。' });
@@ -402,12 +411,4 @@ app.delete('/api/quotes/:id', auth, async (req, res) => {
 });
 app.get('/api/files/:id', auth, async (req, res) => { const { data: file, error } = await supabase.from('nl_files').select('*').eq('id', req.params.id).maybeSingle(); if (error) return fail(res, error); if (!file) return res.sendStatus(404); const { allowed, error: accessError } = await canAccessFile(req.user, file); if (accessError) return fail(res, accessError); if (!allowed) return res.sendStatus(403); const { data, error: downloadError } = await supabase.storage.from('nutrilink-files').download(file.storage_path); if (downloadError) return fail(res, downloadError); res.type(file.mime_type || 'application/octet-stream').attachment(normalizeFilename(file.original_name)).send(Buffer.from(await data.arrayBuffer())); });
 app.delete('/api/files/:id', auth, async (req, res) => { const { data: file, error } = await supabase.from('nl_files').select('*').eq('id', req.params.id).maybeSingle(); if (error) return fail(res, error); if (!file) return res.sendStatus(404); const { allowed, error: accessError } = await canAccessFile(req.user, file); if (accessError) return fail(res, accessError); if (!allowed || (isFactory(req.user) && file.uploaded_by_name !== req.user.name)) return res.sendStatus(403); const { error: storageError } = await supabase.storage.from('nutrilink-files').remove([file.storage_path]); if (storageError) return fail(res, storageError); const { error: deleteError } = await supabase.from('nl_files').delete().eq('id', file.id); if (deleteError) return fail(res, deleteError); res.sendStatus(204); });
-httpServer.on('upgrade', (req, socket, head) => {
-  if (!req.url?.startsWith('/api/notifications/stream')) return socket.destroy();
-  try {
-    const token = new URL(req.url, `http://${req.headers.host}`).searchParams.get('token');
-    const user = jwt.verify(token || '', SECRET);
-    wsServer.handleUpgrade(req, socket, head, ws => { ws.user = user; notificationSockets.add(ws); ws.on('close', () => notificationSockets.delete(ws)); });
-  } catch { socket.destroy(); }
-});
 httpServer.listen(PORT, () => console.log(`NutriLink running on ${PORT}`));
