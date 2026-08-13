@@ -4,6 +4,7 @@ const express = require('express');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const multer = require('multer');
+const XLSX = require('xlsx');
 const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
@@ -25,6 +26,7 @@ const productInfoLabels = { formula: '完整配方', formula_version: '配方版
 const displayValue = value => value === null || value === undefined || value === '' ? '未填写' : String(value).slice(0, 180);
 const changedFields = (before, after, fields) => fields.filter(field => String(before[field] ?? '') !== String(after[field] ?? '')).map(field => `${productInfoLabels[field] || field}：${displayValue(before[field])} -> ${displayValue(after[field])}`);
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
+const quoteUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
 const isFactory = user => user.role === 'factory';
 const normalizeFilename = value => {
   const filename = String(value || '未命名文件');
@@ -216,10 +218,74 @@ app.post('/api/orders/:id/reminders', auth, async (req, res) => {
 app.get('/api/reminders', auth, async (req, res) => { const { data, error } = await supabase.from('nl_reminders').select('*').order('created_at', { ascending: false }).limit(100); if (error) return fail(res, error); if (!isFactory(req.user)) return res.json(data); const { ids, error: orderError } = await factoryOrderIds(req.user.factory_name); if (orderError) return fail(res, orderError); res.json(data.filter(item => ids.has(item.order_id))); });
 app.post('/api/reminders/:id/read', auth, async (req, res) => { const { data: reminder, error: findError } = await supabase.from('nl_reminders').select('*,nl_orders(factory_name)').eq('id', req.params.id).maybeSingle(); if (findError) return fail(res, findError); if (!reminder) return res.sendStatus(404); if (isFactory(req.user) && reminder.nl_orders?.factory_name !== req.user.factory_name) return res.sendStatus(403); const { data, error } = await supabase.from('nl_reminders').update({ read_at: new Date().toISOString(), read_by_name: req.user.name }).eq('id', reminder.id).select().single(); if (error) return fail(res, error); res.json(data); });
 app.post('/api/orders/:id/comments', auth, async (req, res) => { const order = await orderAccess(req, res, req.params.id); if (!order) return; const message = String(req.body.message || '').trim(); const mentions = Array.isArray(req.body.mentions) ? req.body.mentions.join(', ') : String(req.body.mentions || ''); if (!message) return res.status(400).json({ error: '请输入评论内容。' }); const { data, error } = await supabase.from('nl_comments').insert({ order_id: order.id, message, mentions, created_by_name: req.user.name, created_by_role: req.user.role }).select().single(); if (error) return fail(res, error); await activity({ orderId: order.id, action: '添加协作评论', detail: message, actor: req.user, targetRole: isFactory(req.user) ? 'brand' : 'factory' }); if (mentions) await notify({ orderId: order.id, kind: '评论提及', title: `${req.user.name} 在“留言”中提及你`, detail: message, targetRole: isFactory(req.user) ? 'brand' : 'factory', actor: req.user }); res.status(201).json(data); });
+const quotePayload = (body, actor) => ({ product_name: String(body.product_name || '').trim(), factory_name: String(body.factory_name || '').trim(), currency: String(body.currency || 'CNY').trim(), unit_price: Number(body.unit_price), moq: body.moq || null, sample_fee: body.sample_fee || null, production_days: body.production_days || null, payment_terms: String(body.payment_terms || '').trim() || null, quoted_at: body.quoted_at || new Date().toISOString().slice(0, 10), note: String(body.note || '').trim() || null, created_by_name: actor.name });
+const validQuote = payload => payload.product_name && payload.factory_name && Number.isFinite(payload.unit_price) && payload.unit_price >= 0;
+const parsePrice = value => Number(String(value || '').replace(/[^0-9.-]/g, ''));
+const parseQuoteDate = value => {
+  if (value instanceof Date && !Number.isNaN(value.valueOf())) return value.toISOString().slice(0, 10);
+  const dateText = String(value || '').trim(); const matched = dateText.match(/^(\d{4})[/-](\d{1,2})[/-](\d{1,2})$/);
+  if (matched) return `${matched[1]}-${matched[2].padStart(2, '0')}-${matched[3].padStart(2, '0')}`;
+  const numeric = Number(value);
+  if (Number.isFinite(numeric) && numeric > 20000) return XLSX.SSF.format('yyyy-mm-dd', numeric);
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.valueOf()) ? null : parsed.toISOString().slice(0, 10);
+};
 app.get('/api/quotes', auth, async (req, res) => { let query = supabase.from('nl_quotes').select('*').order('quoted_at', { ascending: true }); if (req.query.product_name) query = query.eq('product_name', req.query.product_name); const { data, error } = await query; if (error) return fail(res, error); if (!isFactory(req.user)) return res.json(data); res.json(data.filter(item => item.factory_name === req.user.factory_name)); });
-app.post('/api/quotes', auth, async (req, res) => { if (isFactory(req.user)) return res.sendStatus(403); const payload = { product_name: String(req.body.product_name || '').trim(), factory_name: String(req.body.factory_name || '').trim(), currency: String(req.body.currency || 'USD').trim(), unit_price: Number(req.body.unit_price), moq: req.body.moq || null, sample_fee: req.body.sample_fee || null, production_days: req.body.production_days || null, payment_terms: String(req.body.payment_terms || '').trim() || null, quoted_at: req.body.quoted_at || new Date().toISOString().slice(0, 10), note: String(req.body.note || '').trim() || null, created_by_name: req.user.name };
+app.get('/api/quote-imports', auth, async (req, res) => {
+  if (isFactory(req.user)) return res.sendStatus(403);
+  const [{ data: imports, error }, { data: importedQuotes, error: importedError }, { count: legacyCount, error: countError }] = await Promise.all([
+    supabase.from('nl_quote_imports').select('*').order('uploaded_at', { ascending: false }),
+    supabase.from('nl_quotes').select('import_id,product_name,factory_name').not('import_id', 'is', null),
+    supabase.from('nl_quotes').select('*', { count: 'exact', head: true }).is('import_id', null)
+  ]);
+  if (error || importedError || countError) return fail(res, error || importedError || countError);
+  const enriched = (imports || []).map(item => { const rows = (importedQuotes || []).filter(quote => quote.import_id === item.id); return { ...item, products: [...new Set(rows.map(row => row.product_name))], factories: [...new Set(rows.map(row => row.factory_name))] }; });
+  res.json({ imports: enriched, legacy_count: legacyCount || 0 });
+});
+app.get('/api/quote-imports/:id/file', auth, async (req, res) => {
+  if (isFactory(req.user)) return res.sendStatus(403);
+  const { data: source, error } = await supabase.from('nl_quote_imports').select('*').eq('id', req.params.id).maybeSingle();
+  if (error) return fail(res, error); if (!source?.storage_path) return res.status(404).json({ error: '此历史数据没有可用的原始表。' });
+  const { data, error: downloadError } = await supabase.storage.from('nutrilink-quote-sources').download(source.storage_path);
+  if (downloadError) return fail(res, downloadError); res.type('application/vnd.openxmlformats-officedocument.spreadsheetml.sheet').attachment(normalizeFilename(source.source_file_name || source.display_name)).send(Buffer.from(await data.arrayBuffer()));
+});
+app.post('/api/quote-imports', auth, quoteUpload.single('file'), async (req, res) => {
+  if (isFactory(req.user)) return res.sendStatus(403);
+  if (!req.file) return res.status(400).json({ error: '请选择 Excel 报价表。' });
+  let rows;
+  try { const workbook = XLSX.read(req.file.buffer, { type: 'buffer', cellDates: true }); const sheet = workbook.Sheets[workbook.SheetNames[0]]; rows = XLSX.utils.sheet_to_json(sheet, { defval: '', raw: false }); } catch { return res.status(400).json({ error: '无法读取 Excel 文件，请上传 .xlsx 格式报价表。' }); }
+  const missing = ['产品名称', '采购成本', '工厂名称', '谈判时间'].filter(key => !rows.length || !(key in rows[0]));
+  if (missing.length) return res.status(400).json({ error: `报价表缺少必填列：${missing.join('、')}。` });
+  const parsed = rows.map(row => quotePayload({ product_name: row['产品名称'], factory_name: row['工厂名称'], unit_price: parsePrice(row['采购成本']), quoted_at: parseQuoteDate(row['谈判时间']), note: row['备注'], currency: row['币种'] || 'CNY', moq: row['MOQ'], sample_fee: row['打样费'], production_days: row['生产周期'], payment_terms: row['付款条件'] }, req.user)).filter(validQuote);
+  if (!parsed.length) return res.status(400).json({ error: '未找到有效报价行，请检查产品名称、采购成本和工厂名称。' });
+  const originalName = normalizeFilename(req.file.originalname); const storagePath = `${crypto.randomUUID()}${path.extname(originalName) || '.xlsx'}`;
+  const { error: uploadError } = await supabase.storage.from('nutrilink-quote-sources').upload(storagePath, req.file.buffer, { contentType: req.file.mimetype || 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', upsert: false });
+  if (uploadError) return fail(res, uploadError);
+  const { data: source, error: sourceError } = await supabase.from('nl_quote_imports').insert({ display_name: String(req.body.display_name || originalName).trim() || originalName, source_file_name: originalName, storage_path: storagePath, uploaded_by_name: req.user.name, record_count: parsed.length }).select().single();
+  if (sourceError) { await supabase.storage.from('nutrilink-quote-sources').remove([storagePath]); return fail(res, sourceError); }
+  const { data: existing, error: existingError } = await supabase.from('nl_quotes').select('id,product_name,factory_name,quoted_at');
+  if (existingError) return fail(res, existingError);
+  const existingByKey = new Map((existing || []).map(item => [`${item.quoted_at}|${item.factory_name}|${item.product_name}`, item.id]));
+  const inserts = [], updates = [];
+  parsed.forEach(item => { const key = `${item.quoted_at}|${item.factory_name}|${item.product_name}`; const record = { ...item, import_id: source.id, source_file_name: originalName }; const id = existingByKey.get(key); if (id) updates.push({ id, record }); else inserts.push(record); });
+  const { data: inserted, error: insertError } = inserts.length ? await supabase.from('nl_quotes').insert(inserts).select() : { data: [], error: null };
+  if (insertError) return fail(res, insertError);
+  for (const update of updates) { const { error: updateError } = await supabase.from('nl_quotes').update(update.record).eq('id', update.id); if (updateError) return fail(res, updateError); }
+  res.status(201).json({ source, records: inserted, imported_count: inserts.length + updates.length, updated_count: updates.length, skipped_rows: rows.length - parsed.length });
+});
+app.put('/api/quote-imports/:id', auth, async (req, res) => {
+  if (isFactory(req.user)) return res.sendStatus(403);
+  const display_name = String(req.body.display_name || '').trim(); if (!display_name) return res.status(400).json({ error: '请输入表格名称。' });
+  const { data, error } = await supabase.from('nl_quote_imports').update({ display_name }).eq('id', req.params.id).select().maybeSingle(); if (error) return fail(res, error); if (!data) return res.sendStatus(404); res.json(data);
+});
+app.post('/api/quotes', auth, async (req, res) => { if (isFactory(req.user)) return res.sendStatus(403); const payload = quotePayload(req.body, req.user);
   if (!payload.product_name || !payload.factory_name || !Number.isFinite(payload.unit_price)) return res.status(400).json({ error: '产品、工厂和单价为必填项。' });
   const { data, error } = await supabase.from('nl_quotes').insert(payload).select().single(); if (error) return fail(res, error); res.status(201).json(data);
+});
+app.put('/api/quotes/:id', auth, async (req, res) => {
+  if (isFactory(req.user)) return res.sendStatus(403); const payload = quotePayload(req.body, req.user);
+  if (!validQuote(payload)) return res.status(400).json({ error: '产品、工厂和单价为必填项。' });
+  const { data, error } = await supabase.from('nl_quotes').update(payload).eq('id', req.params.id).select().maybeSingle(); if (error) return fail(res, error); if (!data) return res.sendStatus(404); res.json(data);
 });
 app.delete('/api/quotes/:id', auth, async (req, res) => {
   if (isFactory(req.user)) return res.sendStatus(403);
