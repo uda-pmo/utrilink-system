@@ -231,6 +231,26 @@ const parseQuoteDate = value => {
   return Number.isNaN(parsed.valueOf()) ? null : parsed.toISOString().slice(0, 10);
 };
 app.get('/api/quotes', auth, async (req, res) => { let query = supabase.from('nl_quotes').select('*').order('quoted_at', { ascending: true }); if (req.query.product_name) query = query.eq('product_name', req.query.product_name); const { data, error } = await query; if (error) return fail(res, error); if (!isFactory(req.user)) return res.json(data); res.json(data.filter(item => item.factory_name === req.user.factory_name)); });
+app.get('/api/quote-filter-options', auth, async (req, res) => {
+  const { data, error } = await supabase.from('nl_quote_filter_options').select('*').order('value');
+  if (error) return fail(res, error); res.json(data);
+});
+app.post('/api/quote-filter-options', auth, async (req, res) => {
+  if (isFactory(req.user)) return res.sendStatus(403);
+  const option_type = String(req.body.option_type || ''); const value = String(req.body.value || '').trim();
+  if (!['product', 'factory'].includes(option_type) || !value) return res.status(400).json({ error: '请选择选项类型并填写名称。' });
+  const { data, error } = await supabase.from('nl_quote_filter_options').insert({ option_type, value, created_by_name: req.user.name }).select().single();
+  if (error) return res.status(error.code === '23505' ? 409 : 500).json({ error: error.code === '23505' ? '该选项已存在。' : error.message }); res.status(201).json(data);
+});
+app.put('/api/quote-filter-options/:id', auth, async (req, res) => {
+  if (isFactory(req.user)) return res.sendStatus(403); const value = String(req.body.value || '').trim();
+  if (!value) return res.status(400).json({ error: '选项名称不能为空。' });
+  const { data, error } = await supabase.from('nl_quote_filter_options').update({ value }).eq('id', req.params.id).select().maybeSingle();
+  if (error) return res.status(error.code === '23505' ? 409 : 500).json({ error: error.code === '23505' ? '该选项已存在。' : error.message }); if (!data) return res.sendStatus(404); res.json(data);
+});
+app.delete('/api/quote-filter-options/:id', auth, async (req, res) => {
+  if (isFactory(req.user)) return res.sendStatus(403); const { error } = await supabase.from('nl_quote_filter_options').delete().eq('id', req.params.id); if (error) return fail(res, error); res.sendStatus(204);
+});
 app.get('/api/quote-imports', auth, async (req, res) => {
   if (isFactory(req.user)) return res.sendStatus(403);
   const [{ data: imports, error }, { data: importedQuotes, error: importedError }, { count: legacyCount, error: countError }] = await Promise.all([
