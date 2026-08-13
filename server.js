@@ -1,13 +1,18 @@
 const path = require('path');
 const crypto = require('crypto');
+const http = require('http');
 const express = require('express');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const multer = require('multer');
 const XLSX = require('xlsx');
+const { WebSocketServer } = require('ws');
 const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
+const httpServer = http.createServer(app);
+const notificationSockets = new Set();
+const wsServer = new WebSocketServer({ noServer: true });
 const PORT = process.env.PORT || 3000;
 const SECRET = process.env.JWT_SECRET;
 const url = process.env.SUPABASE_URL;
@@ -73,20 +78,37 @@ const canAccessFile = async (user, file) => {
 };
 const canAccessOrder = (user, order) => !isFactory(user) || order.factory_name === user.factory_name;
 const getOrder = async id => supabase.from('nl_orders').select('*').eq('id', id).maybeSingle();
+const broadcastNotification = notification => {
+  const message = JSON.stringify({ type: 'notification', notification });
+  notificationSockets.forEach(socket => {
+    if (socket.readyState === 1 && (!notification.target_role || socket.user?.role === notification.target_role)) socket.send(message);
+  });
+};
 const notify = async ({ orderId, kind = '系统消息', title, detail = '', targetRole, actor }) => {
-  const { error } = await supabase.from('nl_notifications').insert({ order_id: orderId, kind, title, detail, target_role: targetRole, created_by_name: actor.name, created_by_role: actor.role });
+  const { data, error } = await supabase.from('nl_notifications').insert({ order_id: orderId, kind, title, detail, target_role: targetRole, created_by_name: actor.name, created_by_role: actor.role }).select().single();
+  if (!error) broadcastNotification(data);
   return error;
 };
 const milestoneFields = ['node_key', 'node_name', 'sequence', 'plan_date', 'actual_date', 'status', 'delay_reason'];
 const defaultMilestones = [
-  ['formula_confirmed', '配方确认'], ['packaging_confirmed', '包材确认'], ['contract_confirmed', '合同确认'],
+  ['formula_confirmed', '配方确认'], ['packaging_confirmed', '包材确认'], ['quote_confirmed', '报价确认'], ['contract_confirmed', '合同确认'],
   ['raw_material_purchase', '原料启动采购'], ['raw_material_received', '原料进厂验收'], ['sampling', '打样'],
   ['production', '正式投产'], ['semi_finished_test', '半成品检验'], ['finished_production', '成品生产完成'],
   ['outer_packaging', '外包装完工'], ['sample_sent', '样板寄出（可选）'], ['shipment', '货物安排出货']
 ];
 const ensureMilestones = async orderId => {
   const { data: existing, error } = await supabase.from('nl_milestones').select('id').eq('order_id', orderId).limit(1);
-  if (error || existing?.length) return error;
+  if (error) return error;
+  if (existing?.length) {
+    const { data: quoteNode, error: quoteError } = await supabase.from('nl_milestones').select('id').eq('order_id', orderId).eq('node_key', 'quote_confirmed').maybeSingle();
+    if (quoteError || quoteNode) return quoteError;
+    const { error: insertError } = await supabase.from('nl_milestones').insert({ order_id: orderId, node_key: 'quote_confirmed', node_name: '报价确认', sequence: 3 });
+    if (insertError) return insertError;
+    const { data: nodes, error: nodesError } = await supabase.from('nl_milestones').select('id').eq('order_id', orderId).order('sequence');
+    if (nodesError) return nodesError;
+    for (const [index, node] of (nodes || []).entries()) { const { error: sequenceError } = await supabase.from('nl_milestones').update({ sequence: index + 1 }).eq('id', node.id); if (sequenceError) return sequenceError; }
+    return null;
+  }
   const { error: insertError } = await supabase.from('nl_milestones').insert(defaultMilestones.map(([node_key, node_name], sequence) => ({ order_id: orderId, node_key, node_name, sequence: sequence + 1 })));
   return insertError;
 };
@@ -182,6 +204,17 @@ app.put('/api/orders/:id/milestones/:milestoneId', auth, async (req, res) => {
   const finalize = req.body.finalize === true;
   if (isFactory(req.user)) delete payload.plan_date;
   if (finalize) {
+    const { data: currentMilestone, error: currentError } = await supabase.from('nl_milestones').select('*').eq('id', req.params.milestoneId).eq('order_id', order.id).maybeSingle();
+    if (currentError) return fail(res, currentError); if (!currentMilestone) return res.sendStatus(404);
+    const { data: previous, error: previousError } = await supabase.from('nl_milestones').select('status,actual_date').eq('order_id', order.id).lt('sequence', currentMilestone.sequence).order('sequence', { ascending: false }).limit(1).maybeSingle();
+    if (previousError) return fail(res, previousError);
+    if (previous && !(previous.actual_date || previous.status === '已完成')) return res.status(400).json({ error: '请先完成上一里程碑节点。' });
+    if (currentMilestone.node_key === 'quote_confirmed') {
+      if (isFactory(req.user)) return res.status(403).json({ error: '报价确认需由品牌方审核后完成。' });
+      const { data: quote, error: quoteError } = await supabase.from('nl_quotes').select('id').eq('product_name', order.product_name).eq('factory_name', order.factory_name).limit(1).maybeSingle();
+      if (quoteError) return fail(res, quoteError);
+      if (!quote) return res.status(400).json({ error: '请先录入该产品与工厂的报价，再确认报价节点。' });
+    }
     payload.status = '已完成';
     payload.actual_date = payload.actual_date || new Date().toISOString().slice(0, 10);
   }
@@ -220,7 +253,7 @@ app.post('/api/reminders/:id/read', auth, async (req, res) => { const { data: re
 app.post('/api/orders/:id/comments', auth, async (req, res) => { const order = await orderAccess(req, res, req.params.id); if (!order) return; const message = String(req.body.message || '').trim(); const mentions = Array.isArray(req.body.mentions) ? req.body.mentions.join(', ') : String(req.body.mentions || ''); if (!message) return res.status(400).json({ error: '请输入评论内容。' }); const { data, error } = await supabase.from('nl_comments').insert({ order_id: order.id, message, mentions, created_by_name: req.user.name, created_by_role: req.user.role }).select().single(); if (error) return fail(res, error); await activity({ orderId: order.id, action: '添加协作评论', detail: message, actor: req.user, targetRole: isFactory(req.user) ? 'brand' : 'factory' }); if (mentions) await notify({ orderId: order.id, kind: '评论提及', title: `${req.user.name} 在“留言”中提及你`, detail: message, targetRole: isFactory(req.user) ? 'brand' : 'factory', actor: req.user }); res.status(201).json(data); });
 const today = () => new Date().toISOString().slice(0, 10);
 const normalizedCurrency = value => String(value || 'CNY').trim().toUpperCase();
-const quotePayload = (body, actor, options = {}) => ({ product_name: String(body.product_name || '').trim(), factory_name: String(body.factory_name || '').trim(), currency: normalizedCurrency(body.currency), unit_price: Number(body.unit_price), moq: body.moq || null, sample_fee: body.sample_fee || null, production_days: body.production_days || null, payment_terms: String(body.payment_terms || '').trim() || null, quoted_at: options.quotedAt || body.quoted_at || today(), note: String(body.note || '').trim() || null, created_by_name: actor.name, submitted_by_name: actor.name, submitted_at: new Date().toISOString(), source_kind: options.sourceKind || 'manual' });
+const quotePayload = (body, actor, options = {}) => ({ product_name: String(body.product_name || '').trim(), factory_name: String(body.factory_name || '').trim(), currency: normalizedCurrency(body.currency), unit_price: Number(body.unit_price), moq: body.moq || null, sample_fee: body.sample_fee || null, production_days: body.production_days || null, payment_terms: String(body.payment_terms || '').trim() || null, quoted_at: options.quotedAt || body.quoted_at || today(), note: String(body.note || '').trim() || null, price_change_reason: String(body.price_change_reason || '').trim() || null, based_on_quote_id: options.basedOnQuoteId || null, created_by_name: actor.name, submitted_by_name: actor.name, submitted_at: new Date().toISOString(), source_kind: options.sourceKind || 'manual' });
 const validQuote = payload => payload.product_name && payload.factory_name && Number.isFinite(payload.unit_price) && payload.unit_price >= 0;
 // Temporary incident mode: do not query nl_exchange_rates or an external service.
 // Restore date-specific rates only after the exchange-rate schema is repaired.
@@ -241,15 +274,6 @@ const attachCnyPrice = payload => {
 };
 const normalizeQuoteForResponse = quote => {
   try { return attachCnyPrice(quote); } catch { return quote; }
-};
-const canFactoryQuote = async (factoryName, productName) => {
-  const { data: matchingOrders, error: orderError } = await supabase.from('nl_orders').select('id').eq('factory_name', factoryName).eq('product_name', productName);
-  if (orderError) throw orderError;
-  const ids = (matchingOrders || []).map(item => item.id);
-  if (!ids.length) return false;
-  const { data: milestones, error } = await supabase.from('nl_milestones').select('actual_date,status').in('order_id', ids).eq('node_key', 'formula_confirmed');
-  if (error) throw error;
-  return (milestones || []).some(item => item.actual_date || item.status === '已完成');
 };
 const parsePrice = value => Number(String(value || '').replace(/[^0-9.-]/g, ''));
 const parseQuoteDate = value => {
@@ -333,31 +357,32 @@ app.put('/api/quote-imports/:id', auth, async (req, res) => {
 });
 app.post('/api/quotes', auth, async (req, res) => {
   const forcedFactory = isFactory(req.user) ? req.user.factory_name : undefined;
-  const payload = quotePayload({ ...req.body, ...(forcedFactory ? { factory_name: forcedFactory } : {}) }, req.user, { quotedAt: today(), sourceKind: isFactory(req.user) ? 'factory' : 'manual' });
+  const previousId = req.body.based_on_quote_id ? Number(req.body.based_on_quote_id) : null;
+  const previous = previousId ? (await supabase.from('nl_quotes').select('*').eq('id', previousId).maybeSingle()).data : null;
+  if (previousId && !previous) return res.status(404).json({ error: '未找到要更正的原报价。' });
+  if (isFactory(req.user) && previous && previous.factory_name !== req.user.factory_name) return res.sendStatus(403);
+  const payload = quotePayload({ ...req.body, ...(forcedFactory ? { factory_name: forcedFactory } : {}) }, req.user, { sourceKind: isFactory(req.user) ? 'factory' : 'manual', basedOnQuoteId: previousId });
   if (!validQuote(payload)) return res.status(400).json({ error: '产品、工厂和单价为必填项。' });
-  if (isFactory(req.user) && !(await canFactoryQuote(req.user.factory_name, payload.product_name))) return res.status(403).json({ error: '配方确认完成后，工厂才能提交该产品报价。' });
+  if (previous && Number(previous.unit_price) !== payload.unit_price && !payload.price_change_reason) return res.status(400).json({ error: '价格变更时必须填写变更原因。' });
   let normalized;
   try { normalized = attachCnyPrice(payload); } catch (error) { return res.status(400).json({ error: error.message }); }
-  const { data, error } = await supabase.from('nl_quotes').insert(normalized).select().single(); if (error) return fail(res, error); res.status(201).json(data);
+  const { data, error } = await supabase.from('nl_quotes').insert(normalized).select().single(); if (error) return fail(res, error);
+  // Notifications are supplementary. A notification-table issue must not turn a
+  // successfully saved quote into a failed user action.
+  if (isFactory(req.user)) await notify({ orderId: null, kind: '工厂新报价', title: `${req.user.name} 提交了新的工厂报价`, detail: `${data.product_name} · ${data.factory_name} · ${data.currency} ${data.unit_price}`, targetRole: 'brand', actor: req.user });
+  res.status(201).json(data);
 });
 app.put('/api/quotes/:id', auth, async (req, res) => {
   const { data: current, error: findError } = await supabase.from('nl_quotes').select('*').eq('id', req.params.id).maybeSingle();
   if (findError) return fail(res, findError); if (!current) return res.sendStatus(404);
-  if (isFactory(req.user)) return res.status(403).json({ error: '更正报价请新建版本，历史报价不会被覆盖。' });
-  const payload = quotePayload(req.body, req.user, { quotedAt: current.quoted_at, sourceKind: current.source_kind || (current.import_id ? 'import' : 'manual') });
+  if (isFactory(req.user)) return res.status(403).json({ error: '更正报价请提交新版本，历史报价不会被覆盖。' });
+  const payload = quotePayload(req.body, req.user, { sourceKind: current.source_kind || (current.import_id ? 'import' : 'manual') });
   if (!validQuote(payload)) return res.status(400).json({ error: '产品、工厂和单价为必填项。' });
+  if (Number(current.unit_price) !== payload.unit_price && !payload.price_change_reason) return res.status(400).json({ error: '价格变更时必须填写变更原因。' });
   let normalized;
   try { normalized = attachCnyPrice(payload); } catch (error) { return res.status(400).json({ error: error.message }); }
   normalized.import_id = current.import_id; normalized.source_file_name = current.source_file_name;
   const { data, error } = await supabase.from('nl_quotes').update(normalized).eq('id', req.params.id).select().maybeSingle(); if (error) return fail(res, error); res.json(data);
-});
-app.get('/api/quotes/factory-eligibility', auth, async (req, res) => {
-  if (!isFactory(req.user)) return res.json({ eligible_products: [] });
-  const { data: ownOrders, error } = await supabase.from('nl_orders').select('id,product_name').eq('factory_name', req.user.factory_name);
-  if (error) return fail(res, error);
-  const eligible = [];
-  for (const order of ownOrders || []) if (await canFactoryQuote(req.user.factory_name, order.product_name)) eligible.push(order.product_name);
-  res.json({ eligible_products: [...new Set(eligible)].sort((a, b) => a.localeCompare(b, 'zh-CN')) });
 });
 app.post('/api/quotes/backfill-cny', auth, async (req, res) => {
   if (isFactory(req.user)) return res.sendStatus(403);
@@ -377,4 +402,12 @@ app.delete('/api/quotes/:id', auth, async (req, res) => {
 });
 app.get('/api/files/:id', auth, async (req, res) => { const { data: file, error } = await supabase.from('nl_files').select('*').eq('id', req.params.id).maybeSingle(); if (error) return fail(res, error); if (!file) return res.sendStatus(404); const { allowed, error: accessError } = await canAccessFile(req.user, file); if (accessError) return fail(res, accessError); if (!allowed) return res.sendStatus(403); const { data, error: downloadError } = await supabase.storage.from('nutrilink-files').download(file.storage_path); if (downloadError) return fail(res, downloadError); res.type(file.mime_type || 'application/octet-stream').attachment(normalizeFilename(file.original_name)).send(Buffer.from(await data.arrayBuffer())); });
 app.delete('/api/files/:id', auth, async (req, res) => { const { data: file, error } = await supabase.from('nl_files').select('*').eq('id', req.params.id).maybeSingle(); if (error) return fail(res, error); if (!file) return res.sendStatus(404); const { allowed, error: accessError } = await canAccessFile(req.user, file); if (accessError) return fail(res, accessError); if (!allowed || (isFactory(req.user) && file.uploaded_by_name !== req.user.name)) return res.sendStatus(403); const { error: storageError } = await supabase.storage.from('nutrilink-files').remove([file.storage_path]); if (storageError) return fail(res, storageError); const { error: deleteError } = await supabase.from('nl_files').delete().eq('id', file.id); if (deleteError) return fail(res, deleteError); res.sendStatus(204); });
-app.listen(PORT, () => console.log(`NutriLink running on ${PORT}`));
+httpServer.on('upgrade', (req, socket, head) => {
+  if (!req.url?.startsWith('/api/notifications/stream')) return socket.destroy();
+  try {
+    const token = new URL(req.url, `http://${req.headers.host}`).searchParams.get('token');
+    const user = jwt.verify(token || '', SECRET);
+    wsServer.handleUpgrade(req, socket, head, ws => { ws.user = user; notificationSockets.add(ws); ws.on('close', () => notificationSockets.delete(ws)); });
+  } catch { socket.destroy(); }
+});
+httpServer.listen(PORT, () => console.log(`NutriLink running on ${PORT}`));
