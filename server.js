@@ -218,8 +218,46 @@ app.post('/api/orders/:id/reminders', auth, async (req, res) => {
 app.get('/api/reminders', auth, async (req, res) => { const { data, error } = await supabase.from('nl_reminders').select('*').order('created_at', { ascending: false }).limit(100); if (error) return fail(res, error); if (!isFactory(req.user)) return res.json(data); const { ids, error: orderError } = await factoryOrderIds(req.user.factory_name); if (orderError) return fail(res, orderError); res.json(data.filter(item => ids.has(item.order_id))); });
 app.post('/api/reminders/:id/read', auth, async (req, res) => { const { data: reminder, error: findError } = await supabase.from('nl_reminders').select('*,nl_orders(factory_name)').eq('id', req.params.id).maybeSingle(); if (findError) return fail(res, findError); if (!reminder) return res.sendStatus(404); if (isFactory(req.user) && reminder.nl_orders?.factory_name !== req.user.factory_name) return res.sendStatus(403); const { data, error } = await supabase.from('nl_reminders').update({ read_at: new Date().toISOString(), read_by_name: req.user.name }).eq('id', reminder.id).select().single(); if (error) return fail(res, error); res.json(data); });
 app.post('/api/orders/:id/comments', auth, async (req, res) => { const order = await orderAccess(req, res, req.params.id); if (!order) return; const message = String(req.body.message || '').trim(); const mentions = Array.isArray(req.body.mentions) ? req.body.mentions.join(', ') : String(req.body.mentions || ''); if (!message) return res.status(400).json({ error: '请输入评论内容。' }); const { data, error } = await supabase.from('nl_comments').insert({ order_id: order.id, message, mentions, created_by_name: req.user.name, created_by_role: req.user.role }).select().single(); if (error) return fail(res, error); await activity({ orderId: order.id, action: '添加协作评论', detail: message, actor: req.user, targetRole: isFactory(req.user) ? 'brand' : 'factory' }); if (mentions) await notify({ orderId: order.id, kind: '评论提及', title: `${req.user.name} 在“留言”中提及你`, detail: message, targetRole: isFactory(req.user) ? 'brand' : 'factory', actor: req.user }); res.status(201).json(data); });
-const quotePayload = (body, actor) => ({ product_name: String(body.product_name || '').trim(), factory_name: String(body.factory_name || '').trim(), currency: String(body.currency || 'CNY').trim(), unit_price: Number(body.unit_price), moq: body.moq || null, sample_fee: body.sample_fee || null, production_days: body.production_days || null, payment_terms: String(body.payment_terms || '').trim() || null, quoted_at: body.quoted_at || new Date().toISOString().slice(0, 10), note: String(body.note || '').trim() || null, created_by_name: actor.name });
+const today = () => new Date().toISOString().slice(0, 10);
+const normalizedCurrency = value => String(value || 'CNY').trim().toUpperCase();
+const quotePayload = (body, actor, options = {}) => ({ product_name: String(body.product_name || '').trim(), factory_name: String(body.factory_name || '').trim(), currency: normalizedCurrency(body.currency), unit_price: Number(body.unit_price), moq: body.moq || null, sample_fee: body.sample_fee || null, production_days: body.production_days || null, payment_terms: String(body.payment_terms || '').trim() || null, quoted_at: options.quotedAt || body.quoted_at || today(), note: String(body.note || '').trim() || null, created_by_name: actor.name, submitted_by_name: actor.name, submitted_at: new Date().toISOString(), source_kind: options.sourceKind || 'manual' });
 const validQuote = payload => payload.product_name && payload.factory_name && Number.isFinite(payload.unit_price) && payload.unit_price >= 0;
+const supportedCurrencies = new Set(['CNY', 'USD', 'KRW']);
+const quoteSource = quote => quote.source_file_name || quote.created_by_name || quote.submitted_by_name || '系统录入';
+const rateForQuote = async (currency, rateDate) => {
+  currency = normalizedCurrency(currency);
+  if (!supportedCurrencies.has(currency)) throw new Error(`暂不支持 ${currency} 的人民币折算，请选择 CNY、USD 或 KRW。`);
+  if (currency === 'CNY') return { rate: 1, provider: 'fixed', date: rateDate };
+  const { data: cached, error: cacheError } = await supabase.from('nl_exchange_rates').select('*').eq('currency', currency).eq('rate_date', rateDate).maybeSingle();
+  if (cacheError) throw cacheError;
+  if (cached) return { rate: Number(cached.rate_to_cny), provider: cached.provider, date: rateDate };
+  let response, payload;
+  try {
+    response = await fetch(`https://api.frankfurter.dev/v1/${rateDate}?base=${encodeURIComponent(currency)}&symbols=CNY`, { signal: AbortSignal.timeout(8000) });
+    payload = await response.json();
+  } catch {
+    throw new Error(`${rateDate} 的 ${currency}/CNY 汇率暂时无法获取，请稍后重新提交。`);
+  }
+  const rate = Number(payload?.rates?.CNY);
+  if (!response.ok || !Number.isFinite(rate) || rate <= 0) throw new Error(`${rateDate} 缺少可用的 ${currency}/CNY 历史汇率，无法保存统一人民币报价。`);
+  const provider = 'frankfurter';
+  const { error: writeError } = await supabase.from('nl_exchange_rates').upsert({ rate_date: rateDate, currency, rate_to_cny: rate, provider, fetched_at: new Date().toISOString() }, { onConflict: 'rate_date,currency' });
+  if (writeError) throw writeError;
+  return { rate, provider, date: rateDate };
+};
+const attachCnyPrice = async payload => {
+  const fx = await rateForQuote(payload.currency, payload.quoted_at);
+  return { ...payload, fx_rate_to_cny: fx.rate, fx_rate_date: fx.date, fx_provider: fx.provider, cny_unit_price: Number((payload.unit_price * fx.rate).toFixed(4)) };
+};
+const canFactoryQuote = async (factoryName, productName) => {
+  const { data: matchingOrders, error: orderError } = await supabase.from('nl_orders').select('id').eq('factory_name', factoryName).eq('product_name', productName);
+  if (orderError) throw orderError;
+  const ids = (matchingOrders || []).map(item => item.id);
+  if (!ids.length) return false;
+  const { data: milestones, error } = await supabase.from('nl_milestones').select('actual_date,status').in('order_id', ids).eq('node_key', 'formula_confirmed');
+  if (error) throw error;
+  return (milestones || []).some(item => item.actual_date || item.status === '已完成');
+};
 const parsePrice = value => Number(String(value || '').replace(/[^0-9.-]/g, ''));
 const parseQuoteDate = value => {
   if (value instanceof Date && !Number.isNaN(value.valueOf())) return value.toISOString().slice(0, 10);
@@ -276,7 +314,9 @@ app.post('/api/quote-imports', auth, quoteUpload.single('file'), async (req, res
   try { const workbook = XLSX.read(req.file.buffer, { type: 'buffer', cellDates: true }); const sheet = workbook.Sheets[workbook.SheetNames[0]]; rows = XLSX.utils.sheet_to_json(sheet, { defval: '', raw: false }); } catch { return res.status(400).json({ error: '无法读取 Excel 文件，请上传 .xlsx 格式报价表。' }); }
   const missing = ['产品名称', '采购成本', '工厂名称', '谈判时间'].filter(key => !rows.length || !(key in rows[0]));
   if (missing.length) return res.status(400).json({ error: `报价表缺少必填列：${missing.join('、')}。` });
-  const parsed = rows.map(row => quotePayload({ product_name: row['产品名称'], factory_name: row['工厂名称'], unit_price: parsePrice(row['采购成本']), quoted_at: parseQuoteDate(row['谈判时间']), note: row['备注'], currency: row['币种'] || 'CNY', moq: row['MOQ'], sample_fee: row['打样费'], production_days: row['生产周期'], payment_terms: row['付款条件'] }, req.user)).filter(validQuote);
+  const parsedBase = rows.map(row => quotePayload({ product_name: row['产品名称'], factory_name: row['工厂名称'], unit_price: parsePrice(row['采购成本']), quoted_at: parseQuoteDate(row['谈判时间']), note: row['备注'], currency: row['币种'] || 'CNY', moq: row['MOQ'], sample_fee: row['打样费'], production_days: row['生产周期'], payment_terms: row['付款条件'] }, req.user, { sourceKind: 'import' })).filter(validQuote);
+  let parsed;
+  try { parsed = await Promise.all(parsedBase.map(attachCnyPrice)); } catch (error) { return res.status(400).json({ error: error.message }); }
   if (!parsed.length) return res.status(400).json({ error: '未找到有效报价行，请检查产品名称、采购成本和工厂名称。' });
   const originalName = normalizeFilename(req.file.originalname); const storagePath = `${crypto.randomUUID()}${path.extname(originalName) || '.xlsx'}`;
   const { error: uploadError } = await supabase.storage.from('nutrilink-quote-sources').upload(storagePath, req.file.buffer, { contentType: req.file.mimetype || 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', upsert: false });
@@ -287,7 +327,7 @@ app.post('/api/quote-imports', auth, quoteUpload.single('file'), async (req, res
   if (existingError) return fail(res, existingError);
   const existingByKey = new Map((existing || []).map(item => [`${item.quoted_at}|${item.factory_name}|${item.product_name}`, item.id]));
   const inserts = [], updates = [];
-  parsed.forEach(item => { const key = `${item.quoted_at}|${item.factory_name}|${item.product_name}`; const record = { ...item, import_id: source.id, source_file_name: originalName }; const id = existingByKey.get(key); if (id) updates.push({ id, record }); else inserts.push(record); });
+  parsed.forEach(item => { const key = `${item.quoted_at}|${item.factory_name}|${item.product_name}`; const record = { ...item, import_id: source.id, source_file_name: originalName, source_kind: 'import' }; const id = existingByKey.get(key); if (id) updates.push({ id, record }); else inserts.push(record); });
   const { data: inserted, error: insertError } = inserts.length ? await supabase.from('nl_quotes').insert(inserts).select() : { data: [], error: null };
   if (insertError) return fail(res, insertError);
   for (const update of updates) { const { error: updateError } = await supabase.from('nl_quotes').update(update.record).eq('id', update.id); if (updateError) return fail(res, updateError); }
@@ -298,14 +338,43 @@ app.put('/api/quote-imports/:id', auth, async (req, res) => {
   const display_name = String(req.body.display_name || '').trim(); if (!display_name) return res.status(400).json({ error: '请输入表格名称。' });
   const { data, error } = await supabase.from('nl_quote_imports').update({ display_name }).eq('id', req.params.id).select().maybeSingle(); if (error) return fail(res, error); if (!data) return res.sendStatus(404); res.json(data);
 });
-app.post('/api/quotes', auth, async (req, res) => { if (isFactory(req.user)) return res.sendStatus(403); const payload = quotePayload(req.body, req.user);
-  if (!payload.product_name || !payload.factory_name || !Number.isFinite(payload.unit_price)) return res.status(400).json({ error: '产品、工厂和单价为必填项。' });
-  const { data, error } = await supabase.from('nl_quotes').insert(payload).select().single(); if (error) return fail(res, error); res.status(201).json(data);
+app.post('/api/quotes', auth, async (req, res) => {
+  const forcedFactory = isFactory(req.user) ? req.user.factory_name : undefined;
+  const payload = quotePayload({ ...req.body, ...(forcedFactory ? { factory_name: forcedFactory } : {}) }, req.user, { quotedAt: today(), sourceKind: isFactory(req.user) ? 'factory' : 'manual' });
+  if (!validQuote(payload)) return res.status(400).json({ error: '产品、工厂和单价为必填项。' });
+  if (isFactory(req.user) && !(await canFactoryQuote(req.user.factory_name, payload.product_name))) return res.status(403).json({ error: '配方确认完成后，工厂才能提交该产品报价。' });
+  let normalized;
+  try { normalized = await attachCnyPrice(payload); } catch (error) { return res.status(400).json({ error: error.message }); }
+  const { data, error } = await supabase.from('nl_quotes').insert(normalized).select().single(); if (error) return fail(res, error); res.status(201).json(data);
 });
 app.put('/api/quotes/:id', auth, async (req, res) => {
-  if (isFactory(req.user)) return res.sendStatus(403); const payload = quotePayload(req.body, req.user);
+  const { data: current, error: findError } = await supabase.from('nl_quotes').select('*').eq('id', req.params.id).maybeSingle();
+  if (findError) return fail(res, findError); if (!current) return res.sendStatus(404);
+  if (isFactory(req.user)) return res.status(403).json({ error: '更正报价请新建版本，历史报价不会被覆盖。' });
+  const payload = quotePayload(req.body, req.user, { quotedAt: current.quoted_at, sourceKind: current.source_kind || (current.import_id ? 'import' : 'manual') });
   if (!validQuote(payload)) return res.status(400).json({ error: '产品、工厂和单价为必填项。' });
-  const { data, error } = await supabase.from('nl_quotes').update(payload).eq('id', req.params.id).select().maybeSingle(); if (error) return fail(res, error); if (!data) return res.sendStatus(404); res.json(data);
+  let normalized;
+  try { normalized = await attachCnyPrice(payload); } catch (error) { return res.status(400).json({ error: error.message }); }
+  normalized.import_id = current.import_id; normalized.source_file_name = current.source_file_name;
+  const { data, error } = await supabase.from('nl_quotes').update(normalized).eq('id', req.params.id).select().maybeSingle(); if (error) return fail(res, error); res.json(data);
+});
+app.get('/api/quotes/factory-eligibility', auth, async (req, res) => {
+  if (!isFactory(req.user)) return res.json({ eligible_products: [] });
+  const { data: ownOrders, error } = await supabase.from('nl_orders').select('id,product_name').eq('factory_name', req.user.factory_name);
+  if (error) return fail(res, error);
+  const eligible = [];
+  for (const order of ownOrders || []) if (await canFactoryQuote(req.user.factory_name, order.product_name)) eligible.push(order.product_name);
+  res.json({ eligible_products: [...new Set(eligible)].sort((a, b) => a.localeCompare(b, 'zh-CN')) });
+});
+app.post('/api/quotes/backfill-cny', auth, async (req, res) => {
+  if (isFactory(req.user)) return res.sendStatus(403);
+  const { data: pending, error } = await supabase.from('nl_quotes').select('*').is('cny_unit_price', null).order('quoted_at');
+  if (error) return fail(res, error);
+  const failures = []; let updated = 0;
+  for (const quote of pending || []) {
+    try { const normalized = await attachCnyPrice({ ...quote, currency: normalizedCurrency(quote.currency), quoted_at: quote.quoted_at }); const { error: updateError } = await supabase.from('nl_quotes').update({ cny_unit_price: normalized.cny_unit_price, fx_rate_to_cny: normalized.fx_rate_to_cny, fx_rate_date: normalized.fx_rate_date, fx_provider: normalized.fx_provider }).eq('id', quote.id); if (updateError) throw updateError; updated += 1; } catch (backfillError) { failures.push({ id: quote.id, message: backfillError.message }); }
+  }
+  res.json({ updated, pending: (pending || []).length, failures });
 });
 app.delete('/api/quotes/:id', auth, async (req, res) => {
   if (isFactory(req.user)) return res.sendStatus(403);
