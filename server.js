@@ -89,7 +89,7 @@ const notify = async ({ orderId, kind = '系统消息', title, detail = '', targ
   if (!error) broadcastNotification(data);
   return error;
 };
-const milestoneFields = ['node_key', 'node_name', 'sequence', 'plan_date', 'actual_date', 'status', 'delay_reason'];
+const milestoneFields = ['node_key', 'node_name', 'sequence', 'plan_date', 'actual_date', 'status', 'delay_reason', 'owner_name'];
 const defaultMilestones = [
   ['formula_confirmed', '配方确认'], ['packaging_confirmed', '包材确认'], ['quote_confirmed', '报价确认'], ['contract_confirmed', '合同确认'],
   ['raw_material_purchase', '原料启动采购'], ['raw_material_received', '原料进厂验收'], ['sampling', '打样'],
@@ -102,14 +102,14 @@ const ensureMilestones = async orderId => {
   if (existing?.length) {
     const { data: quoteNode, error: quoteError } = await supabase.from('nl_milestones').select('id').eq('order_id', orderId).eq('node_key', 'quote_confirmed').maybeSingle();
     if (quoteError || quoteNode) return quoteError;
-    const { error: insertError } = await supabase.from('nl_milestones').insert({ order_id: orderId, node_key: 'quote_confirmed', node_name: '报价确认', sequence: 3 });
+    const { error: insertError } = await supabase.from('nl_milestones').insert({ order_id: orderId, node_key: 'quote_confirmed', node_name: '报价确认', sequence: 3, owner_name: '品牌方' });
     if (insertError) return insertError;
     const { data: nodes, error: nodesError } = await supabase.from('nl_milestones').select('id').eq('order_id', orderId).order('sequence');
     if (nodesError) return nodesError;
     for (const [index, node] of (nodes || []).entries()) { const { error: sequenceError } = await supabase.from('nl_milestones').update({ sequence: index + 1 }).eq('id', node.id); if (sequenceError) return sequenceError; }
     return null;
   }
-  const { error: insertError } = await supabase.from('nl_milestones').insert(defaultMilestones.map(([node_key, node_name], sequence) => ({ order_id: orderId, node_key, node_name, sequence: sequence + 1 })));
+  const { error: insertError } = await supabase.from('nl_milestones').insert(defaultMilestones.map(([node_key, node_name], sequence) => ({ order_id: orderId, node_key, node_name, sequence: sequence + 1, owner_name: ['formula_confirmed', 'quote_confirmed', 'contract_confirmed'].includes(node_key) ? '品牌方' : '工厂' })));
   return insertError;
 };
 const orderAccess = async (req, res, id) => {
@@ -202,7 +202,7 @@ app.put('/api/orders/:id/milestones/:milestoneId', auth, async (req, res) => {
   const order = await orderAccess(req, res, req.params.id); if (!order) return;
   const payload = Object.fromEntries(milestoneFields.filter(key => req.body[key] !== undefined).map(key => [key, req.body[key] === '' ? null : req.body[key]]));
   const finalize = req.body.finalize === true;
-  if (isFactory(req.user)) delete payload.plan_date;
+  if (isFactory(req.user)) { delete payload.plan_date; delete payload.owner_name; }
   if (finalize) {
     const { data: currentMilestone, error: currentError } = await supabase.from('nl_milestones').select('*').eq('id', req.params.milestoneId).eq('order_id', order.id).maybeSingle();
     if (currentError) return fail(res, currentError); if (!currentMilestone) return res.sendStatus(404);
