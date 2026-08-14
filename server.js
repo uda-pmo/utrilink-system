@@ -24,8 +24,8 @@ const safeUser = u => ({ id: u.id, name: u.name, email: u.email, role: u.role, f
 const fail = (res, error, fallback = '操作失败。') => res.status(500).json({ error: error?.message || fallback });
 const columns = ['product_name','contract_no','factory_name','batch_no','sku','node','due_date','quantity','formula','formula_version','pack_spec','production_date','shelf_life','expiry_date','progress','status'];
 const orderRecord = body => Object.fromEntries(columns.map(column => [column, body[column] === '' ? null : (body[column] ?? (column === 'progress' ? 0 : null))]));
-const productInfoFields = ['formula', 'formula_version', 'pack_spec', 'shelf_life'];
-const productInfoLabels = { formula: '完整配方', formula_version: '配方版本', pack_spec: '包装规格', shelf_life: '保质期要求' };
+const productInfoFields = ['product_name', 'factory_name', 'sku', 'contract_no', 'quantity', 'pack_spec', 'formula_version', 'status', 'shelf_life', 'formula'];
+const productInfoLabels = { product_name: '产品名称', factory_name: '工厂', sku: 'SKU 条码', contract_no: '合同号', quantity: '生产数量', pack_spec: '包装规格', formula_version: '配方版本', status: '订单状态', shelf_life: '保质期要求', formula: '完整配方' };
 const displayValue = value => value === null || value === undefined || value === '' ? '未填写' : String(value).slice(0, 180);
 const changedFields = (before, after, fields) => fields.filter(field => String(before[field] ?? '') !== String(after[field] ?? '')).map(field => `${productInfoLabels[field] || field}：${displayValue(before[field])} -> ${displayValue(after[field])}`);
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
@@ -100,14 +100,14 @@ const ensureMilestones = async orderId => {
   if (existing?.length) {
     const { data: quoteNode, error: quoteError } = await supabase.from('nl_milestones').select('id').eq('order_id', orderId).eq('node_key', 'quote_confirmed').maybeSingle();
     if (quoteError || quoteNode) return quoteError;
-    const { error: insertError } = await supabase.from('nl_milestones').insert({ order_id: orderId, node_key: 'quote_confirmed', node_name: '报价确认', sequence: 3, owner_name: '品牌方' });
+    const { error: insertError } = await supabase.from('nl_milestones').insert({ order_id: orderId, node_key: 'quote_confirmed', node_name: '报价确认', sequence: 3 });
     if (insertError) return insertError;
     const { data: nodes, error: nodesError } = await supabase.from('nl_milestones').select('id').eq('order_id', orderId).order('sequence');
     if (nodesError) return nodesError;
     for (const [index, node] of (nodes || []).entries()) { const { error: sequenceError } = await supabase.from('nl_milestones').update({ sequence: index + 1 }).eq('id', node.id); if (sequenceError) return sequenceError; }
     return null;
   }
-  const { error: insertError } = await supabase.from('nl_milestones').insert(defaultMilestones.map(([node_key, node_name], sequence) => ({ order_id: orderId, node_key, node_name, sequence: sequence + 1, owner_name: ['formula_confirmed', 'quote_confirmed', 'contract_confirmed'].includes(node_key) ? '品牌方' : '工厂' })));
+  const { error: insertError } = await supabase.from('nl_milestones').insert(defaultMilestones.map(([node_key, node_name], sequence) => ({ order_id: orderId, node_key, node_name, sequence: sequence + 1 })));
   return insertError;
 };
 const orderAccess = async (req, res, id) => {
@@ -183,6 +183,7 @@ app.put('/api/orders/:id', auth, async (req, res) => { const current = await ord
 app.patch('/api/orders/:id/product-info', auth, async (req, res) => {
   const order = await orderAccess(req, res, req.params.id); if (!order) return;
   const payload = Object.fromEntries(productInfoFields.filter(field => req.body[field] !== undefined).map(field => [field, req.body[field] === '' ? null : req.body[field]]));
+  if (isFactory(req.user)) delete payload.factory_name;
   if (!Object.keys(payload).length) return res.status(400).json({ error: '没有可更新的产品或配方信息。' });
   payload.updated_at = new Date().toISOString();
   const { data, error } = await supabase.from('nl_orders').update(payload).eq('id', order.id).select().single();
@@ -237,6 +238,8 @@ app.put('/api/orders/:id/milestones/:milestoneId', auth, async (req, res) => {
   if (finalize) {
     await activity({ orderId: order.id, action: `确认完成里程碑：${milestone.node_name}`, detail: `${milestone.status} · 实际 ${milestone.actual_date}`, actor: req.user, targetRole: isFactory(req.user) ? 'brand' : 'factory' });
     await notify({ orderId: order.id, kind: '里程碑确认', title: `${req.user.name} 确认完成“${milestone.node_name}”`, detail: `实际完成日期：${milestone.actual_date}`, targetRole: isFactory(req.user) ? 'brand' : 'factory', actor: req.user });
+  } else if (isFactory(req.user) && Object.keys(payload).length) {
+    await notify({ orderId: order.id, kind: '里程碑反馈', title: `${req.user.name} 更新了“${milestone.node_name}”的当前进展`, detail: milestone.delay_reason || milestone.status || '请查看里程碑维护页', targetRole: 'brand', actor: req.user });
   }
   res.json(milestone);
 });
@@ -260,6 +263,17 @@ app.post('/api/orders/:id/reminders', auth, async (req, res) => {
 app.get('/api/reminders', auth, async (req, res) => { const { data, error } = await supabase.from('nl_reminders').select('*').order('created_at', { ascending: false }).limit(100); if (error) return fail(res, error); if (!isFactory(req.user)) return res.json(data); const { ids, error: orderError } = await factoryOrderIds(req.user.factory_name); if (orderError) return fail(res, orderError); res.json(data.filter(item => ids.has(item.order_id))); });
 app.post('/api/reminders/:id/read', auth, async (req, res) => { const { data: reminder, error: findError } = await supabase.from('nl_reminders').select('*,nl_orders(factory_name)').eq('id', req.params.id).maybeSingle(); if (findError) return fail(res, findError); if (!reminder) return res.sendStatus(404); if (isFactory(req.user) && reminder.nl_orders?.factory_name !== req.user.factory_name) return res.sendStatus(403); const { data, error } = await supabase.from('nl_reminders').update({ read_at: new Date().toISOString(), read_by_name: req.user.name }).eq('id', reminder.id).select().single(); if (error) return fail(res, error); res.json(data); });
 app.post('/api/orders/:id/comments', auth, async (req, res) => { const order = await orderAccess(req, res, req.params.id); if (!order) return; const message = String(req.body.message || '').trim(); const mentions = Array.isArray(req.body.mentions) ? req.body.mentions.join(', ') : String(req.body.mentions || ''); if (!message) return res.status(400).json({ error: '请输入评论内容。' }); const { data, error } = await supabase.from('nl_comments').insert({ order_id: order.id, message, mentions, created_by_name: req.user.name, created_by_role: req.user.role }).select().single(); if (error) return fail(res, error); await activity({ orderId: order.id, action: '添加协作评论', detail: message, actor: req.user, targetRole: isFactory(req.user) ? 'brand' : 'factory' }); if (mentions) await notify({ orderId: order.id, kind: '评论提及', title: `${req.user.name} 在“留言”中提及你`, detail: message, targetRole: isFactory(req.user) ? 'brand' : 'factory', actor: req.user }); res.status(201).json(data); });
+app.post('/api/orders/:orderId/comments/:commentId/read', auth, async (req, res) => {
+  const order = await orderAccess(req, res, req.params.orderId); if (!order) return;
+  const { data: comment, error: findError } = await supabase.from('nl_comments').select('*').eq('id', req.params.commentId).eq('order_id', order.id).maybeSingle();
+  if (findError) return fail(res, findError); if (!comment) return res.sendStatus(404);
+  if (comment.created_by_name === req.user.name) return res.status(400).json({ error: '不能将自己发送的留言标记为已阅。' });
+  if (comment.read_at) return res.json(comment);
+  const { data, error } = await supabase.from('nl_comments').update({ read_at: new Date().toISOString(), read_by_name: req.user.name }).eq('id', comment.id).select().single();
+  if (error) return fail(res, error);
+  await notify({ orderId: order.id, kind: '留言已阅', title: `${req.user.name} 已阅了你的留言`, detail: comment.message, targetRole: comment.created_by_role, actor: req.user });
+  res.json(data);
+});
 const today = () => new Date().toISOString().slice(0, 10);
 const normalizedCurrency = value => String(value || 'CNY').trim().toUpperCase();
 const quotePayload = (body, actor, options = {}) => ({ product_name: String(body.product_name || '').trim(), factory_name: String(body.factory_name || '').trim(), currency: normalizedCurrency(body.currency), unit_price: Number(body.unit_price), moq: body.moq || null, sample_fee: body.sample_fee || null, production_days: body.production_days || null, payment_terms: String(body.payment_terms || '').trim() || null, quoted_at: options.quotedAt || body.quoted_at || today(), note: String(body.note || '').trim() || null, price_change_reason: String(body.price_change_reason || '').trim() || null, based_on_quote_id: options.basedOnQuoteId || null, created_by_name: actor.name, submitted_by_name: actor.name, submitted_at: new Date().toISOString(), source_kind: options.sourceKind || 'manual' });

@@ -228,4 +228,103 @@ window.downloadFile=async(id,name)=>{try{const link=document.createElement('a');
 $('#export').onclick=()=>{const source=view==='quotes'?quotes.map(item=>[item.product_name,item.factory_name,item.quoted_at,item.currency,item.unit_price,item.moq,item.sample_fee,item.production_days,item.payment_terms]):orders.map(item=>[item.product_name,item.factory_name,item.sku,item.node,item.progress,item.due_date,item.status]);const header=view==='quotes'?['产品','工厂','报价日期','币种','单价','MOQ','打样费','生产周期','付款条件']:['产品','工厂','SKU','当前节点','进度','交期','状态'];const csv=[header,...source].map(row=>row.map(value=>`"${String(value??'').replaceAll('"','""')}"`).join(',')).join('\n');const link=document.createElement('a');link.href=URL.createObjectURL(new Blob(['\ufeff'+csv],{type:'text/csv;charset=utf-8'}));link.download=`NutriLink_${view}.csv`;link.click();};
 document.querySelectorAll('.nav').forEach(button=>button.onclick=()=>showView(button.dataset.view));$('#newOrder').onclick=openOrderForm;$('#notificationBell').onclick=()=>showView('dashboard');$('#logout').onclick=()=>{closeFilePreview();notificationStream?.close();localStorage.removeItem('token');location.reload();};
 document.addEventListener('pointerdown', event => { if (!event.target.closest('[data-quote-picker]')) document.querySelectorAll('[data-picker-menu]').forEach(menu => { menu.hidden = true; menu.closest('.multi-picker')?.querySelector('[data-picker-trigger]')?.setAttribute('aria-expanded', 'false'); }); });
+
+// Order detail enhancements: read receipts, manual milestone owners and archive filters.
+let visibleDocumentFiles = [];
+const unreadCommentTodos = order => (order.comments || []).filter(item => item.created_by_name !== user.name && !item.read_at);
+const orderFeedbackTodos = order => [
+  ...(order.files || []).filter(file => ['待审批', '需修改后重提', '驳回'].includes(file.review_status)).map(file => ({ type:'文件', title:`${docTypes[file.document_type] || file.document_type}：${file.original_name}`, detail:file.review_status, anchor:'documentsSection' })),
+  ...(order.milestones || []).filter(item => item.status === '进行中' || overdue(item)).map(item => ({ type:'里程碑', title:item.node_name, detail:overdue(item) ? '已逾期，请处理' : `待 ${item.owner_name || '未指定'} 推进`, anchor:'milestoneSection' })),
+  ...unreadCommentTodos(order).map(item => ({ type:'留言', title:`${item.created_by_name} 的留言待阅`, detail:item.message, anchor:'commentsSection', commentId:item.id })),
+  ...(reminders || []).filter(item => item.order_id === order.id && !item.read_at).map(item => ({ type:'提醒', title:`${item.created_by_name || '协作方'} 提醒你处理`, detail:item.message, anchor:'detailTop' }))
+];
+
+window.markCommentRead = async (orderId, commentId) => {
+  try {
+    await api(`/api/orders/${orderId}/comments/${commentId}/read`, { method:'POST' });
+    await loadData();
+    await openDetail(orderId, 'commentsSection');
+  } catch (error) { alert(error.message); }
+};
+
+window.openOrderTodos = async orderId => {
+  try {
+    const order = await api(`/api/orders/${orderId}`);
+    openedOrderDetail = order;
+    const entries = orderFeedbackTodos(order);
+    $('#orderTodoBody').innerHTML = `<div class="modal-head"><div><h2>待反馈提醒</h2></div><button class="icon-close" onclick="orderTodoModal.close()">×</button></div><div class="order-todo-list">${entries.map(item => `<button type="button" class="todo-entry" onclick="orderTodoModal.close();openDetail(${orderId},'${item.anchor}')"><span>${esc(item.type)}</span><b>${esc(item.title)}</b><small>${esc(item.detail || '待处理')}</small></button>`).join('') || '<p class="empty">当前没有需要你反馈的待办。</p>'}</div><footer><button class="primary" type="button" onclick="orderTodoModal.close()">关闭</button></footer>`;
+    $('#orderTodoModal').showModal();
+  } catch (error) { alert(error.message); }
+};
+
+window.openProductInfoForm = id => {
+  const order = openedOrderDetail?.id === Number(id) ? openedOrderDetail : orderById(id);
+  if (!order) return;
+  const fields = [
+    ['产品名称', 'product_name', order.product_name, ''], ['工厂', 'factory_name', order.factory_name, user.role === 'factory' ? 'disabled' : ''],
+    ['SKU 条码', 'sku', order.sku, ''], ['合同号', 'contract_no', order.contract_no, ''], ['生产数量', 'quantity', order.quantity, ''],
+    ['包装规格', 'pack_spec', order.pack_spec, ''], ['配方版本', 'formula_version', order.formula_version, ''], ['订单状态', 'status', order.status, ''],
+    ['保质期要求（月）', 'shelf_life', order.shelf_life, 'type="number" min="1"']
+  ];
+  $('#orderForm').innerHTML = `<div class="modal-head"><div><h2>产品与配方信息</h2></div><button type="button" class="icon-close" onclick="orderModal.close()">×</button></div><div class="form-grid">${fields.map(([label,name,value,extra]) => `<label>${label}<input name="${name}" value="${esc(value || '')}" ${extra}></label>`).join('')}<label class="wide">完整配方<textarea name="formula">${esc(order.formula || '')}</textarea></label></div><footer><button type="button" class="secondary" onclick="orderModal.close()">取消</button><button class="primary">保存修改</button></footer>`;
+  $('#orderModal').showModal();
+  $('#orderForm').onsubmit = async event => { event.preventDefault(); try { await api(`/api/orders/${id}/product-info`, { method:'PATCH', body:JSON.stringify(Object.fromEntries(new FormData(event.target))) }); $('#orderModal').close(); await loadData(); openDetail(id); } catch (error) { alert(error.message); } };
+};
+
+function renderMilestoneMaintenance(orderId) {
+  const order = openedOrderDetail?.id === Number(orderId) ? openedOrderDetail : orderById(orderId);
+  if (!order) { view = 'orders'; render(); return; }
+  const rows = (order.milestones || []).map(item => `<tr data-milestone-id="${item.id}"><td><b>${esc(item.node_name)}</b></td><td><input type="date" name="plan_date" value="${esc(item.plan_date || '')}" ${user.role === 'factory' ? 'disabled' : ''}></td><td><input type="date" name="actual_date" value="${esc(item.actual_date || '')}"></td><td><select name="status">${['待开始','进行中','已完成','延期'].map(value => `<option ${item.status === value ? 'selected' : ''}>${value}</option>`).join('')}</select></td><td><input name="owner_name" value="${esc(item.owner_name || '')}" placeholder="由品牌方指定" ${user.role === 'factory' ? 'disabled' : ''}></td><td><input name="delay_reason" value="${esc(item.delay_reason || '')}" placeholder="填写当前进展"></td><td><input class="milestone-upload-input" type="file" hidden accept="image/*,.pdf,.doc,.docx,.xls,.xlsx"><button class="outline milestone-upload" type="button" onclick="uploadMilestoneFile(${orderId},${item.id},this.closest('tr'))">上传文件/图片</button><button class="text-action" type="button" onclick="saveMilestoneMaintenance(${orderId},${item.id},this.closest('tr'))">保存</button></td></tr>`).join('');
+  setHeader('维护里程碑', `${order.product_name} · ${order.factory_name}`);
+  $('#content').innerHTML = `<div class="page milestone-maintenance-page"><div class="page-title"><div><h1>维护里程碑</h1></div><button class="outline" onclick="view='orders';render();openDetail(${order.id})">返回订单看板</button></div><section class="panel"><div class="table-wrap milestone-maintenance-table"><table><thead><tr><th>阶段</th><th>计划日期</th><th>实际日期</th><th>状态</th><th>当前待执行人</th><th>当前进展</th><th>操作</th></tr></thead><tbody>${rows}</tbody></table></div></section></div>`;
+}
+
+window.saveMilestoneMaintenance = async (orderId, milestoneId, row) => {
+  const data = {};
+  row.querySelectorAll('[name]').forEach(input => { if (!input.disabled) data[input.name] = input.value; });
+  try { await api(`/api/orders/${orderId}/milestones/${milestoneId}`, { method:'PUT', body:JSON.stringify(data) }); await loadData(); openedOrderDetail = await api(`/api/orders/${orderId}`); renderMilestoneMaintenance(orderId); } catch (error) { alert(error.message); }
+};
+
+window.uploadMilestoneFile = async (orderId, milestoneId, row) => {
+  const input = row.querySelector('.milestone-upload-input');
+  if (!input.files.length) { input.click(); input.onchange = () => uploadMilestoneFile(orderId, milestoneId, row); return; }
+  const order = openedOrderDetail?.id === Number(orderId) ? openedOrderDetail : await api(`/api/orders/${orderId}`);
+  const milestone = (order.milestones || []).find(item => item.id === Number(milestoneId));
+  const form = new FormData(); form.set('file', input.files[0]); form.set('document_type', (milestoneDocumentTypes[milestone?.node_key] || ['other'])[0]);
+  try { await api(`/api/orders/${orderId}/files`, { method:'POST', body:form }); await loadData(); openedOrderDetail = await api(`/api/orders/${orderId}`); renderMilestoneMaintenance(orderId); } catch (error) { alert(error.message); }
+};
+
+function renderDocuments() {
+  setHeader('文档归档', '');
+  const batches = [...new Set(orders.map(order => order.batch_no).filter(Boolean))].sort();
+  $('#content').innerHTML = `<div class="page"><div class="page-title"><div><h1>文档归档库</h1></div></div><div class="filters"><select id="fileBatchFilter"><option value="">全部批号</option>${batches.map(batch => `<option value="${esc(batch)}">${esc(batch)}</option>`).join('')}</select><input id="fileSearch" placeholder="搜索文件名、订单、产品、工厂或批号"><button class="outline" type="button" id="downloadFilteredFiles">一键下载筛选结果</button></div><section class="panel"><div class="table-wrap"><table><thead><tr><th>文件名称</th><th>产品名称</th><th>批号</th><th>文件类型</th><th>上传人</th><th>所属工厂</th><th>上传时间</th><th>审批状态</th><th></th></tr></thead><tbody id="fileRows"></tbody></table></div></section></div>`;
+  const draw = () => {
+    const query = $('#fileSearch').value.toLowerCase(), batch = $('#fileBatchFilter').value;
+    visibleDocumentFiles = files.filter(file => { const order = orderById(file.order_id) || {}; return (!batch || order.batch_no === batch) && `${file.original_name}${file.document_type}${order.product_name || ''}${order.factory_name || ''}${order.batch_no || ''}`.toLowerCase().includes(query); });
+    $('#fileRows').innerHTML = visibleDocumentFiles.map(file => { const order = orderById(file.order_id) || {}; return `<tr><td><span class="file-name"><b>${esc(file.original_name)}</b>${previewButton(file.id)}</span></td><td>${esc(order.product_name || '-')}</td><td>${esc(order.batch_no || '-')}</td><td>${esc(docTypes[file.document_type] || file.document_type || '其他文件')}</td><td>${esc(file.uploaded_by_name || '系统')}</td><td>${esc(order.factory_name || '-')}</td><td>${fmtDate(file.created_at)}</td><td>${badge(file.review_status)}</td><td><button class="text-action" onclick="openDetail(${file.order_id})">处理</button><button class="text-action" onclick="downloadFile(${file.id},'${esc(file.original_name)}')">下载</button></td></tr>`; }).join('') || '<tr><td colspan="9" class="empty">尚未找到符合条件的文件。</td></tr>';
+  };
+  $('#fileSearch').oninput = draw; $('#fileBatchFilter').onchange = draw; $('#downloadFilteredFiles').onclick = () => downloadFilteredFiles(); draw();
+}
+
+window.downloadFilteredFiles = async () => {
+  if (!visibleDocumentFiles.length) return alert('当前筛选没有可下载的文件。');
+  for (const file of visibleDocumentFiles) await downloadFile(file.id, file.original_name);
+};
+
+window.openDetail = async (id, focus = '') => {
+  const order = await api(`/api/orders/${id}`); openedOrderDetail = order;
+  const nodes = order.milestones || [], completed = nodes.filter(item => milestoneState(item) === 'complete').length;
+  const totalProgress = nodes.length ? Math.round(completed / nodes.length * 100) : Number(order.progress || 0);
+  const pendingTodos = orderFeedbackTodos(order);
+  const milestoneRows = nodes.map(item => { const state = milestoneState(item), status = state === 'complete' ? '已完成' : state === 'current' ? '进行中' : state === 'late' ? '已逾期' : '待开始'; return `<article class="milestone-overview-row ${state}"><div class="milestone-stage"><i>${item.sequence}</i><div><b>${esc(item.node_name)}</b>${badge(status)}</div></div><div><small>计划日期</small><b>${fmtDay(item.plan_date)}</b></div><div><small>实际日期</small><b>${fmtDay(item.actual_date)}</b></div><div><small>当前待执行人</small><b>${esc(item.owner_name || '未指定')}</b></div><div class="milestone-row-actions"><button class="text-action" onclick="showMilestoneDetail(${order.id},${item.id})">详情</button><button class="text-action" onclick="remindOrder(${order.id},'${esc(item.node_name)}')">提醒</button></div><div class="milestone-row-progress"><i style="width:${milestonePercent(item)}%"></i></div></article>`; }).join('');
+  const fileRows = (order.files || []).map(file => { const settled = ['已确认', '有条件通过'].includes(file.review_status); return `<tr><td><span class="document-name"><b>${esc(file.original_name)}</b>${previewButton(file.id)}</span></td><td>${esc(docTypes[file.document_type] || file.document_type || '其他文件')}</td><td>${esc(file.uploaded_by_name || '系统')}</td><td>${esc(order.factory_name || '-')}</td><td>${fmtDate(file.created_at)}</td><td>${badge(file.review_status)}</td><td><button class="text-action" onclick="downloadFile(${file.id},'${esc(file.original_name)}')">下载</button>${reviewActions(file,order.id)}${settled ? '<span class="file-action-disabled">已确认</span>' : ''}${user.role === 'brand' || file.uploaded_by_name === user.name ? `<button class="text-action danger" onclick="deleteFile(${file.id},${order.id})">删除</button>` : ''}</td></tr>`; }).join('') || '<tr><td colspan="7" class="empty">尚未上传文件。</td></tr>';
+  const commentRows = (order.comments || []).map(item => `<li><b>${esc(item.created_by_name)}</b><span>${esc(item.message)}</span>${item.mentions ? `<small>提及：${esc(item.mentions)}</small>` : ''}<small>${fmtDate(item.created_at)}${item.read_at ? ` · 已阅${item.read_by_name ? `：${esc(item.read_by_name)}` : ''}` : ''}</small>${item.created_by_name !== user.name && !item.read_at ? `<button class="text-action comment-read" type="button" onclick="markCommentRead(${order.id},${item.id})">已阅</button>` : ''}</li>`).join('') || '<li class="empty">暂无留言记录。</li>';
+  $('#detailBody').innerHTML = `<div id="detailTop" class="modal-head order-board-title"><div><h2>${esc(order.product_name)}</h2><p>${esc(order.factory_name)}${order.sku ? ` · SKU ${esc(order.sku)}` : ' · SKU 待确认'}</p></div><button class="icon-close" onclick="detailModal.close()">×</button></div><section class="order-core-cards"><article class="core-card milestone"><small>当前里程碑阶段</small><b>${esc(order.node || '待确认')}</b><span>整体进度 ${totalProgress}%</span><div><i style="width:${totalProgress}%"></i></div></article><article class="core-card delivery"><small>约定交付日期</small><b>${fmtDay(order.due_date)}</b><span>${overdue({ plan_date: order.due_date }) ? '交期已逾期' : '请按计划推进'}</span></article><button type="button" class="core-card reminders" onclick="openOrderTodos(${order.id})"><small>待反馈提醒</small><b>${pendingTodos.length} 条</b><span>点击查看完整待办明细</span></button><article class="core-card batch"><small>批号</small><b>${esc(order.batch_no || '待生成')}</b><span>保质期要求 ${order.shelf_life ? `${esc(order.shelf_life)} 个月` : '待确认'}</span></article></section><section class="panel order-board-panel product-board"><div class="panel-head"><h3>产品与配方信息</h3><span><button class="text-action" onclick="openProductInfoForm(${order.id})">${user.role === 'factory' ? '提交修改' : '编辑'}</button><button class="text-action" onclick="remindOrder(${order.id},'产品与配方信息')">提醒</button></span></div><dl class="facts product-facts">${[['产品名称', order.product_name], ['工厂', order.factory_name], ['SKU 条码', order.sku || '待申请'], ['合同号', order.contract_no || '合同待上传'], ['生产数量', order.quantity], ['包装规格', order.pack_spec], ['配方版本', order.formula_version], ['订单状态', order.status]].map(([label, value]) => `<div><dt>${label}</dt><dd>${esc(value || '待补充')}</dd></div>`).join('')}</dl><div class="formula"><small>完整配方</small><p>${esc(order.formula || '待补充')}</p></div></section><section id="milestoneSection" class="panel order-board-panel milestone-overview"><div class="panel-head"><h3>订单里程碑总览看板</h3><button class="outline" onclick="openMilestoneMaintenance(${order.id})">维护里程碑</button></div><div class="milestone-overview-list">${milestoneRows}</div></section><section id="documentsSection" class="panel order-board-panel documents document-table"><div class="panel-head"><h3>订单全部文档</h3><form id="uploadForm"><select name="document_type" required><option value="" selected disabled>请选择文件类型</option>${Object.entries(docTypes).map(([value, label]) => `<option value="${value}">${label}</option>`).join('')}<option value="custom">+ 手动添加新选项</option></select><input name="custom_document_type" hidden placeholder="自定义文件类型"><input type="file" name="file" required><button class="outline">上传文件</button><button type="button" class="outline" onclick="downloadAllFiles(${order.id})">下载全部</button><button type="button" class="text-action" onclick="remindOrder(${order.id},'订单文件')">提醒</button></form></div><div class="table-wrap"><table><thead><tr><th>文件名称</th><th>文件类型</th><th>上传人</th><th>所属工厂</th><th>上传时间</th><th>审批状态</th><th></th></tr></thead><tbody>${fileRows}</tbody></table></div></section><section id="commentsSection" class="panel order-board-panel comments"><div class="comment-heading"><h3>留言沟通区</h3><button class="text-action" onclick="remindOrder(${order.id},'留言')">提醒</button></div><form id="commentForm" class="comment-form"><textarea name="message" required placeholder="填写留言或确认结论"></textarea><input name="mentions" placeholder="@成员或部门（选填）"><button class="primary">发送留言</button></form><details class="message-history"><summary>查看全部 ${order.comments.length} 条留言</summary><ol>${commentRows}</ol></details></section>`;
+  if (!$('#detailModal').open) $('#detailModal').showModal();
+  if (focus) requestAnimationFrame(() => $(`#${focus}`)?.scrollIntoView({ behavior:'smooth', block:'start' }));
+  const history = $('#commentsSection .message-history'); history.ontoggle = () => { history.querySelector('summary').textContent = history.open ? '收起留言记录' : `查看全部 ${order.comments.length} 条留言`; };
+  const type = $('#uploadForm select'), custom = $('#uploadForm input[name="custom_document_type"]'); type.onchange = () => { custom.hidden = type.value !== 'custom'; custom.required = type.value === 'custom'; };
+  $('#uploadForm').onsubmit = async event => { event.preventDefault(); const form = new FormData(event.target); if (form.get('document_type') === 'custom') form.set('document_type', form.get('custom_document_type')); try { await api(`/api/orders/${order.id}/files`, { method:'POST', body:form }); await loadData(); openDetail(order.id); } catch (error) { alert(error.message); } };
+  $('#commentForm').onsubmit = async event => { event.preventDefault(); try { await api(`/api/orders/${order.id}/comments`, { method:'POST', body:JSON.stringify(Object.fromEntries(new FormData(event.target))) }); await loadData(); openDetail(order.id); } catch (error) { alert(error.message); } };
+};
 async function signIn(register){const data=Object.fromEntries(new FormData($('#authForm')));try{const result=await api(register?'/api/auth/register':'/api/auth/login',{method:'POST',body:JSON.stringify(data)});localStorage.token=result.token;await start(result.user);}catch(error){$('#authError').textContent=error.message;}}async function start(currentUser){user=currentUser;$('#auth').hidden=true;$('#app').hidden=false;$('#who').textContent=user.name;$('#role').textContent=user.role==='factory'?'Factory Workspace':'Brand PMO';applyLanguage();await loadData();refreshNotificationBadge();connectNotifications();render();}$('#authForm').onsubmit=event=>{event.preventDefault();signIn(false);};$('#register').onclick=()=>signIn(true);$('#language').onchange=event=>{language=event.target.value;localStorage.setItem('nutrilink-language',language);applyLanguage();render();};(async()=>{closeFilePreview();if(!localStorage.token)return;try{await start((await api('/api/auth/me')).user);}catch{localStorage.removeItem('token');}})();
