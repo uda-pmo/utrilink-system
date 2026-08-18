@@ -278,26 +278,33 @@ const today = () => new Date().toISOString().slice(0, 10);
 const normalizedCurrency = value => String(value || 'CNY').trim().toUpperCase();
 const quotePayload = (body, actor, options = {}) => ({ product_name: String(body.product_name || '').trim(), factory_name: String(body.factory_name || '').trim(), currency: normalizedCurrency(body.currency), unit_price: Number(body.unit_price), moq: body.moq || null, sample_fee: body.sample_fee || null, production_days: body.production_days || null, payment_terms: String(body.payment_terms || '').trim() || null, quoted_at: options.quotedAt || body.quoted_at || today(), note: String(body.note || '').trim() || null, price_change_reason: String(body.price_change_reason || '').trim() || null, based_on_quote_id: options.basedOnQuoteId || null, created_by_name: actor.name, submitted_by_name: actor.name, submitted_at: new Date().toISOString(), source_kind: options.sourceKind || 'manual' });
 const validQuote = payload => payload.product_name && payload.factory_name && Number.isFinite(payload.unit_price) && payload.unit_price >= 0;
-// Temporary incident mode: do not query nl_exchange_rates or an external service.
-// Restore date-specific rates only after the exchange-rate schema is repaired.
-const TEMPORARY_FX_DATE = '2026-08-13';
-const TEMPORARY_USD_TO_CNY = Number(process.env.TEMP_USD_TO_CNY || '7.1800');
-const TEMPORARY_KRW_TO_CNY = Number(process.env.TEMP_KRW_TO_CNY || '0.00518');
-const temporaryFxRates = { CNY: 1, USD: TEMPORARY_USD_TO_CNY, KRW: TEMPORARY_KRW_TO_CNY };
 const quoteSource = quote => quote.source_file_name || quote.created_by_name || quote.submitted_by_name || '系统录入';
-const rateForQuote = (currency) => {
+const rateForQuote = async (currency, quotedAt) => {
   currency = normalizedCurrency(currency);
-  const rate = temporaryFxRates[currency];
-  if (!Number.isFinite(rate) || rate <= 0) throw new Error(`临时汇率模式暂不支持 ${currency}，请使用 CNY、USD 或 KRW。`);
-  return { rate, provider: 'temporary-fixed-2026-08-13', date: TEMPORARY_FX_DATE };
+  const rateDate = String(quotedAt || today()).slice(0, 10);
+  if (currency === 'CNY') return { rate: 1, provider: 'CNY', date: rateDate };
+  const { data: cached, error: cachedError } = await supabase.from('nl_exchange_rates').select('rate_to_cny,provider').eq('rate_date', rateDate).eq('currency', currency).maybeSingle();
+  if (cachedError) throw new Error('真实汇率表尚未初始化，请先执行 nl_real_exchange_rates_migration.sql。');
+  if (cached?.rate_to_cny) return { rate: Number(cached.rate_to_cny), provider: cached.provider || 'Frankfurter/ECB', date: rateDate };
+  let response, payload;
+  try {
+    response = await fetch(`https://api.frankfurter.dev/v1/${encodeURIComponent(rateDate)}?base=${encodeURIComponent(currency)}&symbols=CNY`);
+    payload = await response.json();
+  } catch {
+    throw new Error(`无法获取 ${rateDate} 的 ${currency}/CNY 真实汇率，请稍后重试。`);
+  }
+  const rate = Number(payload?.rates?.CNY);
+  if (!response.ok || !Number.isFinite(rate) || rate <= 0) throw new Error(`未找到 ${rateDate} 的 ${currency}/CNY 真实汇率。`);
+  const provider = 'Frankfurter/ECB';
+  const { error: saveError } = await supabase.from('nl_exchange_rates').upsert({ rate_date: rateDate, currency, rate_to_cny: rate, provider }, { onConflict: 'rate_date,currency' });
+  if (saveError) throw saveError;
+  return { rate, provider, date: rateDate };
 };
-const attachCnyPrice = payload => {
-  const fx = rateForQuote(payload.currency);
+const attachCnyPrice = async payload => {
+  const fx = await rateForQuote(payload.currency, payload.quoted_at);
   return { ...payload, fx_rate_to_cny: fx.rate, fx_rate_date: fx.date, fx_provider: fx.provider, cny_unit_price: Number((payload.unit_price * fx.rate).toFixed(4)) };
 };
-const normalizeQuoteForResponse = quote => {
-  try { return attachCnyPrice(quote); } catch { return quote; }
-};
+const normalizeQuoteForResponse = quote => quote;
 const parsePrice = value => Number(String(value || '').replace(/[^0-9.-]/g, ''));
 const parseQuoteDate = value => {
   if (value instanceof Date && !Number.isNaN(value.valueOf())) return value.toISOString().slice(0, 10);
@@ -356,7 +363,7 @@ app.post('/api/quote-imports', auth, quoteUpload.single('file'), async (req, res
   if (missing.length) return res.status(400).json({ error: `报价表缺少必填列：${missing.join('、')}。` });
   const parsedBase = rows.map(row => quotePayload({ product_name: row['产品名称'], factory_name: row['工厂名称'], unit_price: parsePrice(row['采购成本']), quoted_at: parseQuoteDate(row['谈判时间']), note: row['备注'], currency: row['币种'] || 'CNY', moq: row['MOQ'], sample_fee: row['打样费'], production_days: row['生产周期'], payment_terms: row['付款条件'] }, req.user, { sourceKind: 'import' })).filter(validQuote);
   let parsed;
-  try { parsed = parsedBase.map(attachCnyPrice); } catch (error) { return res.status(400).json({ error: error.message }); }
+  try { parsed = await Promise.all(parsedBase.map(attachCnyPrice)); } catch (error) { return res.status(400).json({ error: error.message }); }
   if (!parsed.length) return res.status(400).json({ error: '未找到有效报价行，请检查产品名称、采购成本和工厂名称。' });
   const originalName = normalizeFilename(req.file.originalname); const storagePath = `${crypto.randomUUID()}${path.extname(originalName) || '.xlsx'}`;
   const { error: uploadError } = await supabase.storage.from('nutrilink-quote-sources').upload(storagePath, req.file.buffer, { contentType: req.file.mimetype || 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', upsert: false });
@@ -388,7 +395,7 @@ app.post('/api/quotes', auth, async (req, res) => {
   if (!validQuote(payload)) return res.status(400).json({ error: '产品、工厂和单价为必填项。' });
   if (previous && Number(previous.unit_price) !== payload.unit_price && !payload.price_change_reason) return res.status(400).json({ error: '价格变更时必须填写变更原因。' });
   let normalized;
-  try { normalized = attachCnyPrice(payload); } catch (error) { return res.status(400).json({ error: error.message }); }
+  try { normalized = await attachCnyPrice(payload); } catch (error) { return res.status(400).json({ error: error.message }); }
   const { data, error } = await supabase.from('nl_quotes').insert(normalized).select().single(); if (error) return fail(res, error);
   // Notifications are supplementary. A notification-table issue must not turn a
   // successfully saved quote into a failed user action.
@@ -403,7 +410,7 @@ app.put('/api/quotes/:id', auth, async (req, res) => {
   if (!validQuote(payload)) return res.status(400).json({ error: '产品、工厂和单价为必填项。' });
   if (Number(current.unit_price) !== payload.unit_price && !payload.price_change_reason) return res.status(400).json({ error: '价格变更时必须填写变更原因。' });
   let normalized;
-  try { normalized = attachCnyPrice(payload); } catch (error) { return res.status(400).json({ error: error.message }); }
+  try { normalized = await attachCnyPrice(payload); } catch (error) { return res.status(400).json({ error: error.message }); }
   normalized.import_id = current.import_id; normalized.source_file_name = current.source_file_name;
   const { data, error } = await supabase.from('nl_quotes').update(normalized).eq('id', req.params.id).select().maybeSingle(); if (error) return fail(res, error); res.json(data);
 });
@@ -413,9 +420,9 @@ app.post('/api/quotes/backfill-cny', auth, async (req, res) => {
   if (error) return fail(res, error);
   const failures = []; let updated = 0;
   for (const quote of pending || []) {
-    try { const normalized = attachCnyPrice({ ...quote, currency: normalizedCurrency(quote.currency) }); const { error: updateError } = await supabase.from('nl_quotes').update({ cny_unit_price: normalized.cny_unit_price, fx_rate_to_cny: normalized.fx_rate_to_cny, fx_rate_date: normalized.fx_rate_date, fx_provider: normalized.fx_provider }).eq('id', quote.id); if (updateError) throw updateError; updated += 1; } catch (backfillError) { failures.push({ id: quote.id, message: backfillError.message }); }
+    try { const normalized = await attachCnyPrice({ ...quote, currency: normalizedCurrency(quote.currency) }); const { error: updateError } = await supabase.from('nl_quotes').update({ cny_unit_price: normalized.cny_unit_price, fx_rate_to_cny: normalized.fx_rate_to_cny, fx_rate_date: normalized.fx_rate_date, fx_provider: normalized.fx_provider }).eq('id', quote.id); if (updateError) throw updateError; updated += 1; } catch (backfillError) { failures.push({ id: quote.id, message: backfillError.message }); }
   }
-  res.json({ updated, pending: (pending || []).length, failures, fx_date: TEMPORARY_FX_DATE, usd_to_cny: TEMPORARY_USD_TO_CNY });
+  res.json({ updated, pending: (pending || []).length, failures });
 });
 app.delete('/api/quotes/:id', auth, async (req, res) => {
   if (isFactory(req.user)) return res.sendStatus(403);
