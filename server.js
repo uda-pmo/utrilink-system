@@ -87,7 +87,7 @@ const notify = async ({ orderId, kind = '系统消息', title, detail = '', targ
   if (!error) broadcastNotification(data);
   return error;
 };
-const milestoneFields = ['node_key', 'node_name', 'sequence', 'brand_required_date', 'factory_plan_date', 'completed_date', 'status', 'delay_reason', 'owner_name'];
+const milestoneFields = ['node_key', 'node_name', 'sequence', 'brand_required_date', 'factory_plan_date', 'actual_finish_date', 'status', 'delay_reason', 'owner_name'];
 const defaultMilestones = [
   ['formula_confirmed', '配方确认'], ['packaging_confirmed', '包材确认'], ['quote_confirmed', '报价确认'], ['contract_confirmed', '合同确认'],
   ['raw_material_purchase', '原料启动采购'], ['raw_material_received', '原料进厂验收'], ['sampling', '打样'],
@@ -216,9 +216,9 @@ app.put('/api/orders/:id/milestones/:milestoneId', auth, async (req, res) => {
   if (finalize) {
     const { data: currentMilestone, error: currentError } = await supabase.from('nl_milestones').select('*').eq('id', req.params.milestoneId).eq('order_id', order.id).maybeSingle();
     if (currentError) return fail(res, currentError); if (!currentMilestone) return res.sendStatus(404);
-    const { data: previous, error: previousError } = await supabase.from('nl_milestones').select('status,completed_date').eq('order_id', order.id).lt('sequence', currentMilestone.sequence).order('sequence', { ascending: false }).limit(1).maybeSingle();
+    const { data: previous, error: previousError } = await supabase.from('nl_milestones').select('status,actual_finish_date').eq('order_id', order.id).lt('sequence', currentMilestone.sequence).order('sequence', { ascending: false }).limit(1).maybeSingle();
     if (previousError) return fail(res, previousError);
-    if (previous && !(previous.completed_date || previous.status === '已完成')) return res.status(400).json({ error: '请先完成上一里程碑节点。' });
+    if (previous && !(previous.actual_finish_date || previous.status === '已完成')) return res.status(400).json({ error: '请先完成上一里程碑节点。' });
     if (currentMilestone.node_key === 'quote_confirmed') {
       if (isFactory(req.user)) return res.status(403).json({ error: '报价确认需由品牌方审核后完成。' });
       const { data: quote, error: quoteError } = await supabase.from('nl_quotes').select('id').eq('product_name', order.product_name).eq('factory_name', order.factory_name).limit(1).maybeSingle();
@@ -226,18 +226,18 @@ app.put('/api/orders/:id/milestones/:milestoneId', auth, async (req, res) => {
       if (!quote) return res.status(400).json({ error: '请先录入该产品与工厂的报价，再确认报价节点。' });
     }
     payload.status = '已完成';
-    payload.completed_date = payload.completed_date || new Date().toISOString().slice(0, 10);
+    payload.actual_finish_date = payload.actual_finish_date || new Date().toISOString().slice(0, 10);
   }
   const { data: milestone, error } = await supabase.from('nl_milestones').update(payload).eq('id', req.params.milestoneId).eq('order_id', order.id).select().maybeSingle();
   if (error) return fail(res, error); if (!milestone) return res.sendStatus(404);
-  const complete = milestone.status === '已完成' || milestone.completed_date;
+  const complete = milestone.status === '已完成' || milestone.actual_finish_date;
   const { data: next } = await supabase.from('nl_milestones').select('*').eq('order_id', order.id).order('sequence');
-  const current = (next || []).find(item => !(item.status === '已完成' || item.completed_date)) || milestone;
-  const completed = (next || []).filter(item => item.status === '已完成' || item.completed_date).length;
+  const current = (next || []).find(item => !(item.status === '已完成' || item.actual_finish_date)) || milestone;
+  const completed = (next || []).filter(item => item.status === '已完成' || item.actual_finish_date).length;
   await supabase.from('nl_orders').update({ node: current.node_name, progress: Math.round(completed / Math.max((next || []).length, 1) * 100), updated_at: new Date().toISOString() }).eq('id', order.id);
   if (finalize) {
-    await activity({ orderId: order.id, action: `确认完成里程碑：${milestone.node_name}`, detail: `${milestone.status} · 实际完成 ${milestone.completed_date}`, actor: req.user, targetRole: isFactory(req.user) ? 'brand' : 'factory' });
-    await notify({ orderId: order.id, kind: '里程碑确认', title: `${req.user.name} 确认完成“${milestone.node_name}”`, detail: `实际完成日期：${milestone.completed_date}`, targetRole: isFactory(req.user) ? 'brand' : 'factory', actor: req.user });
+    await activity({ orderId: order.id, action: `确认完成里程碑：${milestone.node_name}`, detail: `${milestone.status} · 实际完成 ${milestone.actual_finish_date}`, actor: req.user, targetRole: isFactory(req.user) ? 'brand' : 'factory' });
+    await notify({ orderId: order.id, kind: '里程碑确认', title: `${req.user.name} 确认完成“${milestone.node_name}”`, detail: `实际完成日期：${milestone.actual_finish_date}`, targetRole: isFactory(req.user) ? 'brand' : 'factory', actor: req.user });
   } else if (isFactory(req.user) && Object.keys(payload).length) {
     await notify({ orderId: order.id, kind: '里程碑反馈', title: `${req.user.name} 更新了“${milestone.node_name}”的阶段进展`, detail: milestone.delay_reason || milestone.status || '请查看里程碑维护页', targetRole: 'brand', actor: req.user });
   }
