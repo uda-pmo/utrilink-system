@@ -5,7 +5,7 @@ const api = async (url, options = {}) => {
   if (!response.ok) throw new Error((await response.json().catch(() => ({}))).error || '操作失败');
   return response.status === 204 ? null : response.json();
 };
-let user, orders = [], files = [], activities = [], reminders = [], notifications = [], quotes = [], quoteOptions = [], factoryEligibleProducts = [], notificationStream = null, view = 'dashboard', editing = null, previewUrl = null;
+let user, orders = [], files = [], activities = [], reminders = [], notifications = [], quotes = [], quoteOptions = [], factoryEligibleProducts = [], notificationStream = null, view = 'dashboard', editing = null, previewUrl = null, milestoneRisks = [];
 let language = localStorage.getItem('nutrilink-language') || 'zh';
 const i18n = {
   zh:{quoteTitle:'报价与成本看板',quoteSub:'追溯报价来源、比较工厂报价与识别成本变化',quoteEntry:'+ 录入报价',history:'查看历史源数据',import:'导入历史源数据',product:'产品',factory:'工厂',clear:'一键清空',selectAll:'一键全选',search:'搜索选项',add:'新增',noOptions:'暂无选项，请新增',trend:'产品报价波动',trendSub:'人民币折算单价（CNY）按报价日期变化',comparison:'工厂最新报价对比',comparisonSub:'每个产品取各工厂最新人民币报价',details:'报价明细',detailsSub:'保存修改后图表与本表会即时同步',date:'报价日期',productName:'产品名称',unitPrice:'原始单价',cnyPrice:'人民币折算价',exchangeRate:'锁定汇率',currency:'币种',moq:'MOQ',sampleFee:'打样费',cycle:'生产周期',payment:'付款条件',note:'备注',source:'来源',operator:'录入人',operatorSearch:'搜索录入人',edit:'编辑',correct:'更正报价',noQuote:'暂无符合条件的报价记录。',noChart:'暂无可使用人民币口径的报价数据',priceDate:'报价日期',priceCny:'单价（CNY）',latest:'最低价',spread:'最高差价',historyTitle:'历史报价源数据',historySub:'按导入批次追溯原表，并可编辑底层报价记录。',rename:'改名',viewData:'查看数据',download:'下载原表',close:'关闭',back:'返回列表',sourceRecords:'原表导入的 {count} 条报价数据，可直接编辑并实时同步看板。',importTitle:'导入历史源数据',importSub:'Excel 必须含“产品名称、采购成本、工厂名称、谈判时间”；原表将保留以供追溯。',tableName:'表格名称',chooseExcel:'Excel 报价表',cancel:'取消',upload:'上传并导入',save:'提交报价',editQuote:'编辑报价记录',newQuote:'录入报价版本',sync:'提交后自动锁定提交日汇率，并实时更新趋势、工厂对比与报价明细。',required:'请输入必填字段。',optionTitle:'新增{type}',optionEdit:'编辑{type}',optionName:'名称',optionSaved:'已保存',delete:'删除',confirmDelete:'确认删除此自定义选项？',legacy:'历史录入数据',legacyInfo:'已有 {count} 条报价记录；该批记录未保存原始 Excel，因此不可预览原表。',records:'条数据',uploadedBy:'上传人',noSource:'尚未上传可追溯的历史报价表。',allFactories:'未选择工厂时显示全部工厂',productRequired:'请至少选择一个产品以查看报价数据。',factoryLocked:'工厂报价需先完成该产品的配方确认。',pendingCny:'待补算'},
@@ -33,16 +33,30 @@ async function loadData() { [orders, files, activities, reminders, notifications
 const refreshNotificationBadge = () => { const unread=notifications.filter(item=>!item.read_at).length, badge=$('#notificationBadge'), count=$('#notificationCount'); if(badge) badge.hidden=!unread; if(count) count.textContent=`${unread} 条未读`; };
 const connectNotifications = () => { if (notificationStream || !localStorage.token) return; notificationStream = new EventSource(`/api/notifications/stream?token=${encodeURIComponent(localStorage.token)}`); notificationStream.addEventListener('notification', event => { try { const item = JSON.parse(event.data); if (!notifications.some(notification => notification.id === item.id)) { notifications.unshift(item); refreshNotificationBadge(); if (view === 'dashboard') renderDashboard(); } } catch {} }); notificationStream.onerror = () => { notificationStream?.close(); notificationStream = null; setTimeout(connectNotifications, 5000); }; };
 function orderRows(items) { return items.map(order => `<tr><td><button class="text-action order-code" onclick="openDetail(${order.id})">${esc(order.product_name || '待补充产品名称')}</button></td><td>${esc(order.factory_name)}</td><td>${esc(order.sku || '待申请')}</td><td>${esc(order.node || '待确认')}</td><td>${progress(order)}</td><td>${fmtDay(order.due_date)}</td><td>${badge(order.status)}</td><td><button class="text-action" onclick="openDetail(${order.id})">详情</button>${user.role === 'brand' ? `<button class="text-action" onclick="editOrder(${order.id})">编辑</button>` : ''}</td></tr>`).join('') || '<tr><td colspan="8" class="empty">还没有符合条件的订单。</td></tr>'; }
-function riskData() {
-  const data = [];
-  activeOrders().forEach(order => {
-    if (!order.contract_no && !files.some(file => file.order_id === order.id && ['brand_contract','factory_contract','contract_file'].includes(file.document_type))) data.push({ level:'高', type:'合同未签', order, detail:'尚未归档双方确认的合同文件' });
-    if (!files.some(file => file.order_id === order.id)) data.push({ level:'中', type:'文件缺失', order, detail:'订单尚未归档任何协作文件' });
-    if (!quotes.some(quote => quote.product_name === order.product_name && quote.factory_name === order.factory_name)) data.push({ level:'中', type:'价格未确认', order, detail:'暂无与订单匹配的报价版本' });
-    if (order.due_date && new Date(`${order.due_date}T23:59:59`) < new Date()) data.push({ level:'高', type:'交期延误', order, detail:`约定交期 ${fmtDay(order.due_date)} 已过期` });
+// The risk board is deliberately limited to milestones. Files, quotes, and contracts
+// may require follow-up, but they are not milestones and must not create duplicate alerts.
+function riskData() { return milestoneRisks; }
+async function loadMilestoneRisks() {
+  const now = new Date();
+  const groups = await Promise.all(activeOrders().map(async order => ({
+    order,
+    milestones: await api(`/api/orders/${order.id}/milestones`).catch(() => [])
+  })));
+  milestoneRisks = groups.flatMap(({ order, milestones: orderMilestones }) => {
+    const candidates = orderMilestones.filter(item => overdue(item) || soon(item));
+    if (!candidates.length) return [];
+    // One order has one alert: keep the milestone whose planned date is nearest to now.
+    const milestone = candidates.slice().sort((a, b) => Math.abs(new Date(`${a.plan_date}T23:59:59`) - now) - Math.abs(new Date(`${b.plan_date}T23:59:59`) - now))[0];
+    const isOverdue = overdue(milestone);
+    return [{
+      level: isOverdue ? '高' : '中',
+      type: isOverdue ? '里程碑已逾期' : '里程碑即将逾期',
+      order,
+      milestone,
+      detail: `${milestone.node_name} · 计划日期 ${fmtDay(milestone.plan_date)}`
+    }];
   });
-  files.filter(file => ['待审批','需修改后重提'].includes(file.review_status)).forEach(file => { const order = orderById(file.order_id); if (order) data.push({ level:file.review_status === '需修改后重提' ? '高' : '中', type:'审批待处理', order, detail:`${file.original_name}：${file.review_status}` }); });
-  return data;
+  return milestoneRisks;
 }
 function workItems() {
   const pendingApprovals = files.filter(file => file.uploaded_by_role === 'factory' && file.review_status === '待审批');
@@ -52,13 +66,18 @@ function workItems() {
 function renderDashboard() {
   const active = activeOrders(), work = workItems(), risks = riskData();
   setHeader('工作看板','审批、交期、工厂待办和风险在同一界面处理');
-  const pmoOverview = user.role==='brand'?`<div class="page-title"><div><h1>PMO 工作看板</h1><p>以实时订单、文件、提醒和审批记录为准</p></div><button class="outline" onclick="showView('orders')">查看全部订单</button></div><section class="kpis"><article class="kpi"><span>进行中订单</span><b>${active.length}</b><small>订单推进中</small></article><article class="kpi"><span>我待审批</span><b class="warning">${work.pendingApprovals.length}</b><small>工厂提交的文件</small></article><article class="kpi"><span>即将逾期</span><b class="warning" id="soonCount">-</b><small>未来 7 天里程碑</small></article><article class="kpi"><span>风险事项</span><b class="warning">${risks.length}</b><small>需优先处理</small></article></section>`:'';
+  const pmoOverview = user.role==='brand'?`<div class="page-title"><div><h1>PMO 工作看板</h1><p>以实时订单、文件、提醒和审批记录为准</p></div><button class="outline" onclick="showView('orders')">查看全部订单</button></div><section class="kpis"><article class="kpi"><span>进行中订单</span><b>${active.length}</b><small>订单推进中</small></article><article class="kpi"><span>我待审批</span><b class="warning">${work.pendingApprovals.length}</b><small>工厂提交的文件</small></article><article class="kpi"><span>即将逾期</span><b class="warning" id="soonCount">-</b><small>未来 7 天里程碑</small></article><article class="kpi"><span>风险事项</span><b class="warning" id="riskCount">${risks.length}</b><small>需优先处理</small></article></section>`:'';
   $('#content').innerHTML = `<div class="page">${pmoOverview}<section class="panel work-panel"><div class="panel-head"><div><h2>协作待办</h2><p>提醒、已读状态与审批动作均留存在系统</p></div></div><div class="work-grid"><article class="work-card" onclick="showView('documents')"><b>我待审批</b><span>${work.pendingApprovals.length} 项</span><small>工厂上传文件等待品牌方处理</small><button class="text-action" onclick="event.stopPropagation();showView('documents')">查看文件</button></article><article class="work-card" onclick="showView('orders')"><b>工厂待提交</b><span>${active.length} 单</span><small>可一键提醒并查看对方是否已读</small><button class="text-action" onclick="event.stopPropagation();showView('orders')">查看订单</button></article><article class="work-card" onclick="showView('risks')"><b>即将逾期</b><span id="soonWork">-</span><small>里程碑计划日期未来 7 天</small><button class="text-action" onclick="event.stopPropagation();showView('risks')">查看预警</button></article><article class="work-card" onclick="showView('risks')"><b>已逾期</b><span id="overdueWork">-</span><small>计划日期已过且未完成</small><button class="text-action danger" onclick="event.stopPropagation();showView('risks')">处理风险</button></article></div></section><div class="dashboard-grid"><section class="panel"><div class="panel-head"><h2>重点订单进度</h2><button class="text-action" onclick="showView('orders')">全部订单</button></div><div class="table-wrap"><table><thead><tr><th>产品名称</th><th>工厂</th><th>SKU</th><th>当前节点</th><th>进度</th><th>交期</th><th>状态</th><th></th></tr></thead><tbody>${orderRows(orders.slice(0,5))}</tbody></table></div></section><section class="panel notifications"><div class="panel-head"><h2>消息提醒</h2><small id="notificationCount">${notifications.filter(item => !item.read_at).length} 条未读</small></div><ul>${notifications.slice(0,6).map(item => `<li><button class="text-action" onclick="readNotification(${item.id},${item.order_id})"><b>${esc(item.title)}</b><span>${esc(item.detail || '订单协作动态')}</span><small>${item.read_at ? `已读 · ${fmtDate(item.read_at)}` : '未读'} · ${fmtDate(item.created_at)}</small></button></li>`).join('') || '<li class="empty">暂无新消息。</li>'}</ul></section></div><section class="panel milestone-alert"><div class="panel-head"><div><h2>里程碑预警</h2><p>跨订单集中显示当前节点、计划日期和延期原因</p></div><button class="text-action" onclick="showView('risks')">查看全部</button></div><div id="milestoneAlerts" class="table-wrap"><p class="empty">正在汇总里程碑...</p></div></section></div>`;
-  Promise.all(active.map(order => api(`/api/orders/${order.id}/milestones`).then(data => ({ order, data })).catch(() => ({ order, data: [] })))).then(groups => {
-    const all = groups.flatMap(group => group.data.map(item => ({ ...item, order: group.order }))); const soonItems = all.filter(soon), overdueItems = all.filter(overdue);
-    const soonCount=$('#soonCount'); if(soonCount) soonCount.textContent = soonItems.length; $('#soonWork').textContent = `${soonItems.length} 项`; $('#overdueWork').textContent = `${overdueItems.length} 项`;
-    $('#milestoneAlerts').innerHTML = `<table><thead><tr><th>订单 / 工厂</th><th>当前节点</th><th>计划日期</th><th>状态</th><th>延期原因</th><th></th></tr></thead><tbody>${[...overdueItems,...soonItems].slice(0,10).map(item => `<tr class="${overdue(item) ? 'row-risk' : ''}"><td><b>${esc(item.order.product_name)}</b><small>${esc(item.order.factory_name)}</small></td><td>${esc(item.node_name)}</td><td>${fmtDay(item.plan_date)}</td><td>${badge(overdue(item) ? '已逾期' : '即将逾期')}</td><td>${esc(item.delay_reason || '-')}</td><td><button class="text-action" onclick="openDetail(${item.order.id})">处理</button></td></tr>`).join('') || '<tr><td colspan="6" class="empty">暂无里程碑预警。</td></tr>'}</tbody></table>`;
-  });
+  loadMilestoneRisks().then(risks => {
+    if (view !== 'dashboard') return;
+    const soonItems = risks.filter(item => item.type === '里程碑即将逾期'), overdueItems = risks.filter(item => item.type === '里程碑已逾期');
+    const soonCount=$('#soonCount'), riskCount=$('#riskCount'), soonWork=$('#soonWork'), overdueWork=$('#overdueWork'), alerts=$('#milestoneAlerts');
+    if (soonCount) soonCount.textContent = soonItems.length;
+    if (riskCount) riskCount.textContent = risks.length;
+    if (soonWork) soonWork.textContent = `${soonItems.length} 项`;
+    if (overdueWork) overdueWork.textContent = `${overdueItems.length} 项`;
+    if (alerts) alerts.innerHTML = `<table><thead><tr><th>订单 / 工厂</th><th>当前节点</th><th>计划日期</th><th>状态</th><th>当前进展</th><th></th></tr></thead><tbody>${risks.map(item => `<tr class="${item.level === '高' ? 'row-risk' : ''}"><td><b>${esc(item.order.product_name)}</b><small>${esc(item.order.factory_name)}</small></td><td>${esc(item.milestone.node_name)}</td><td>${fmtDay(item.milestone.plan_date)}</td><td>${badge(item.type === '里程碑已逾期' ? '已逾期' : '即将逾期')}</td><td>${esc(item.milestone.delay_reason || '-')}</td><td><button class="text-action" onclick="openDetail(${item.order.id})">处理</button></td></tr>`).join('') || '<tr><td colspan="6" class="empty">暂无里程碑预警。</td></tr>'}</tbody></table>`;
+  }).catch(() => { const alerts=$('#milestoneAlerts'); if (view === 'dashboard' && alerts) alerts.innerHTML='<p class="empty">暂时无法汇总里程碑预警。</p>'; });
 }
 function renderOrders() {
   setHeader('代工订单','统一管理订单资料、节点、交期与工厂协作记录'); const factories = [...new Set(orders.map(item => item.factory_name).filter(Boolean))];
@@ -69,11 +88,24 @@ function renderDocuments() {
   setHeader('文档归档','按订单、文件类型、上传方和审批状态追溯'); $('#content').innerHTML = `<div class="page"><div class="page-title"><div><h1>文档归档库</h1><p>${files.length} 份文件，上传时间精确到分钟</p></div></div><div class="filters"><input id="fileSearch" placeholder="搜索文件名、订单或产品名称"></div><section class="panel"><div class="table-wrap"><table><thead><tr><th>文件名称</th><th>产品名称</th><th>文件类型</th><th>上传人</th><th>所属工厂</th><th>上传时间</th><th>审批状态</th><th></th></tr></thead><tbody id="fileRows"></tbody></table></div></section></div>`;
   const draw = () => { const q=$('#fileSearch').value.toLowerCase(); $('#fileRows').innerHTML = files.filter(file=>{const order=orderById(file.order_id)||{};return `${file.original_name}${file.document_type}${order.product_name||''}${order.factory_name||''}`.toLowerCase().includes(q)}).map(file=>{const order=orderById(file.order_id)||{};return `<tr><td><span class="file-name"><b>${esc(file.original_name)}</b>${previewButton(file.id)}</span></td><td>${esc(order.product_name||'-')}</td><td>${esc(docTypes[file.document_type]||file.document_type||'其他文件')}</td><td>${esc(file.uploaded_by_name||'系统')}</td><td>${esc(order.factory_name||'-')}</td><td>${fmtDate(file.created_at)}</td><td>${badge(file.review_status)}</td><td><button class="text-action" onclick="openDetail(${file.order_id})">处理</button><button class="text-action" onclick="downloadFile(${file.id},'${esc(file.original_name)}')">下载</button></td></tr>`}).join('') || '<tr><td colspan="8" class="empty">尚未上传文件。</td></tr>';}; $('#fileSearch').oninput=draw; draw();
 }
-function renderFactories() {
+function drawFactories() {
   setHeader('互联工厂','工厂仅能访问自身订单和被要求提交的资料'); const grouped=Object.values(orders.reduce((all,order)=>((all[order.factory_name]||=[]).push(order),all),{}));
   $('#content').innerHTML=`<div class="page"><div class="page-title"><div><h1>互联工厂</h1><p>基于订单自动汇总的协作状态</p></div></div><section class="factory-grid">${grouped.map(group=>{const name=group[0].factory_name;const risks=riskData().filter(item=>item.order.factory_name===name).length;return `<article class="panel factory-card"><div class="factory-mark">${esc(name.slice(0,1))}</div><h2>${esc(name)}</h2><p>进行中 ${group.filter(item=>Number(item.progress)<100).length} 单</p><dl><div><dt>订单总数</dt><dd>${group.length}</dd></div><div><dt>已归档文件</dt><dd>${files.filter(file=>group.some(order=>order.id===file.order_id)).length}</dd></div><div><dt>风险事项</dt><dd class="${risks?'danger':''}">${risks}</dd></div></dl><button class="outline" onclick="showFactoryOrders('${esc(name)}')">查看订单</button></article>`}).join('')||'<p class="empty">订单保存后将自动生成工厂协作卡片。</p>'}</section></div>`;
 }
-function renderRisks() { const risks=riskData(); setHeader('风险看板','聚合文件、审批、交期、价格和合同风险'); $('#content').innerHTML=`<div class="page"><div class="page-title"><div><h1>风险看板</h1><p>优先处理高风险事项，避免影响订单交付</p></div></div><section class="kpis"><article class="kpi"><span>高风险</span><b class="warning">${risks.filter(item=>item.level==='高').length}</b><small>建议当天处理</small></article><article class="kpi"><span>文件与审批</span><b>${risks.filter(item=>['文件缺失','审批待处理'].includes(item.type)).length}</b><small>合规交付</small></article><article class="kpi"><span>交期与合同</span><b>${risks.filter(item=>['交期延误','合同未签'].includes(item.type)).length}</b><small>履约风险</small></article><article class="kpi"><span>价格未确认</span><b>${risks.filter(item=>item.type==='价格未确认').length}</b><small>成本风险</small></article></section><section class="panel"><div class="table-wrap"><table><thead><tr><th>级别</th><th>风险类型</th><th>订单</th><th>工厂</th><th>说明</th><th></th></tr></thead><tbody>${risks.map(item=>`<tr class="${item.level==='高'?'row-risk':''}"><td>${badge(item.level==='高'?'高风险':'中风险')}</td><td>${esc(item.type)}</td><td>${esc(item.order.product_name)}</td><td>${esc(item.order.factory_name)}</td><td>${esc(item.detail)}</td><td><button class="text-action" onclick="openDetail(${item.order.id})">处理</button></td></tr>`).join('')||'<tr><td colspan="6" class="empty">暂无风险事项。</td></tr>'}</tbody></table></div></section></div>`; }
+function renderFactories() {
+  drawFactories();
+  loadMilestoneRisks().then(() => { if (view === 'factories') drawFactories(); }).catch(() => {});
+}
+function renderRiskBoard(risks) {
+  setHeader('风险看板','仅展示每张订单最近的里程碑交期风险');
+  const high = risks.filter(item => item.level === '高').length, upcoming = risks.filter(item => item.type === '里程碑即将逾期').length, overdueCount = risks.filter(item => item.type === '里程碑已逾期').length;
+  $('#content').innerHTML=`<div class="page"><div class="page-title"><div><h1>风险看板</h1><p>每张订单仅保留距离当前时间最近的一项里程碑风险</p></div></div><section class="kpis"><article class="kpi"><span>高风险</span><b class="warning">${high}</b><small>已逾期，建议当天处理</small></article><article class="kpi"><span>即将逾期</span><b>${upcoming}</b><small>未来 7 天到期</small></article><article class="kpi"><span>已逾期</span><b class="warning">${overdueCount}</b><small>计划日期已过且未完成</small></article><article class="kpi"><span>风险订单</span><b>${risks.length}</b><small>每张订单最多一项</small></article></section><section class="panel"><div class="table-wrap"><table><thead><tr><th>级别</th><th>风险类型</th><th>订单</th><th>工厂</th><th>说明</th><th></th></tr></thead><tbody>${risks.map(item=>`<tr class="${item.level==='高'?'row-risk':''}"><td>${badge(item.level==='高'?'高风险':'中风险')}</td><td>${esc(item.type)}</td><td>${esc(item.order.product_name)}</td><td>${esc(item.order.factory_name)}</td><td>${esc(item.detail)}</td><td><button class="text-action" onclick="openDetail(${item.order.id})">处理</button></td></tr>`).join('')||'<tr><td colspan="6" class="empty">暂无里程碑风险事项。</td></tr>'}</tbody></table></div></section></div>`;
+}
+function renderRisks() {
+  setHeader('风险看板','仅展示每张订单最近的里程碑交期风险');
+  $('#content').innerHTML = '<div class="page"><section class="panel"><p class="empty">正在汇总里程碑风险...</p></section></div>';
+  loadMilestoneRisks().then(risks => { if (view === 'risks') renderRiskBoard(risks); }).catch(() => { if (view === 'risks') $('#content').innerHTML='<div class="page"><section class="panel"><p class="empty">暂时无法汇总里程碑风险。</p></section></div>'; });
+}
 const quoteState = { products: [], factories: [], operator: '' };
 const quoteColors = ['#176b4a','#267485','#a75b20','#7553a6','#b13f56','#59726b'];
 const quoteMoney = item => `${item.currency || 'CNY'} ${Number(item.unit_price || 0).toFixed(2)}`;
