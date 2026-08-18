@@ -79,6 +79,11 @@ const quoteColors = ['#176b4a','#267485','#a75b20','#7553a6','#b13f56','#59726b'
 const quoteMoney = item => `${item.currency || 'CNY'} ${Number(item.unit_price || 0).toFixed(2)}`;
 const quoteCnyMoney = item => item.cny_unit_price === null || item.cny_unit_price === undefined ? t('pendingCny') : `CNY ${Number(item.cny_unit_price).toFixed(2)}`;
 const quoteCnyPrice = item => item.cny_unit_price === null || item.cny_unit_price === undefined || item.cny_unit_price === '' ? Number.NaN : Number(item.cny_unit_price);
+const quoteRemark = item => {
+  const note = String(item.note || '').trim();
+  const reason = String(item.price_change_reason || '').trim();
+  return [note, reason && `调价原因：${reason}`].filter(Boolean).join(' · ') || '待补充';
+};
 const uniqueSorted = values => [...new Set(values.filter(Boolean))].sort((a,b) => a.localeCompare(b, 'zh-CN'));
 const quoteData = () => quotes.filter(item => (!quoteState.products.length || quoteState.products.includes(item.product_name)) && (!quoteState.factories.length || quoteState.factories.includes(item.factory_name)) && (!quoteState.operator || `${item.submitted_by_name||''}${item.created_by_name||''}`.toLowerCase().includes(quoteState.operator.toLowerCase())));
 const quoteOptionValues = type => {
@@ -104,8 +109,63 @@ function comparisonChart(data) {
   return groups.map(([product,items])=>{const latest=Object.values(items.reduce((all,item)=>{const old=all[item.factory_name];if(!old||new Date(old.quoted_at)<=new Date(item.quoted_at))all[item.factory_name]=item;return all;},{}));const low=Math.min(...latest.map(quoteCnyPrice)),high=Math.max(...latest.map(quoteCnyPrice)),max=Math.max(high,1),lowItem=latest.find(item=>quoteCnyPrice(item)===low);const delta=high-low;return `<div class="comparison-group"><div class="comparison-summary"><b>${esc(product)}</b><span>${t('latest')} ${esc(lowItem.factory_name)} ${quoteCnyMoney(lowItem)}，${t('spread')} CNY ${delta.toFixed(2)}（${low ? `+${(delta/low*100).toFixed(1)}` : '0.0'}%）</span></div><div class="vertical-bars">${latest.map(item=>{const price=quoteCnyPrice(item),kind=price===low?'lowest':price===high&&high!==low?'highest':'normal';return `<div class="bar-item ${kind}"><b>${quoteCnyMoney(item)}</b><i style="height:${Math.max(10,price/max*145)}px"></i><span>${esc(item.factory_name)}</span></div>`;}).join('')}</div></div>`;}).join('');
 }
 const refreshPickerSummary = picker => { const key=picker.dataset.quotePicker, title=t(key==='products'?'product':'factory');picker.querySelector('[data-picker-trigger] span').textContent=quoteState[key].length?quoteState[key].join('、'):title; };
-const refreshQuoteBoard = () => { const board=$('#quoteBoard'); if (!board) return; const validProduct=quoteState.products.length>0, data=(validProduct?quoteData():[]).sort((a,b)=>new Date(a.quoted_at)-new Date(b.quoted_at)), chartData=data.filter(item=>Number.isFinite(quoteCnyPrice(item))); board.innerHTML=`<div class="quote-grid"><section class="panel"><div class="panel-head"><div><h2>${t('trend')}</h2><p>${t('trendSub')}</p></div></div>${trendChart(chartData)}</section><section class="panel"><div class="panel-head"><div><h2>${t('comparison')}</h2><p>${t('comparisonSub')}</p></div></div><div class="quote-comparison">${comparisonChart(chartData)}</div></section></div><section class="panel"><div class="panel-head"><div><h2>${t('details')}</h2><p>${t('detailsSub')}</p></div></div><div class="table-wrap"><table><thead><tr><th>${t('date')}</th><th>${t('productName')}</th><th>${t('factory')}</th><th>${t('unitPrice')}</th><th>${t('cnyPrice')}</th><th>${t('exchangeRate')}</th><th>${t('moq')}</th><th>${t('sampleFee')}</th><th>${t('cycle')}</th><th>${t('payment')}</th><th>${t('note')}</th><th>${t('source')}</th><th>${t('operator')}</th><th></th></tr></thead><tbody>${data.slice().reverse().map(item=>`<tr><td>${fmtDay(item.quoted_at)}</td><td>${esc(item.product_name)}</td><td>${esc(item.factory_name)}</td><td><b>${quoteMoney(item)}</b></td><td><b>${quoteCnyMoney(item)}</b></td><td>${item.fx_rate_to_cny ? `${Number(item.fx_rate_to_cny).toFixed(4)}<small> ${fmtDay(item.fx_rate_date)}</small>` : '-'}</td><td>${esc(item.moq||'-')}</td><td>${esc(item.sample_fee||'-')}</td><td>${esc(item.production_days||'-')}</td><td>${esc(item.payment_terms||'-')}</td><td>${esc([item.note,item.price_change_reason?`调价原因：${item.price_change_reason}`:''].filter(Boolean).join(' · ')||'-')}</td><td>${esc(item.source_file_name||item.created_by_name||'-')}</td><td>${esc(item.submitted_by_name||item.created_by_name||'-')}</td><td>${user.role==='brand'?`<button class="text-action" onclick="openQuoteEdit(${item.id})">${t('edit')}</button>`:user.role==='factory'?`<button class="text-action" onclick="openQuoteCorrection(${item.id})">${t('correct')}</button>`:''}</td></tr>`).join('')||`<tr><td colspan="14" class="empty">${validProduct?t('noQuote'):t('productRequired')}</td></tr>`}</tbody></table></div></section>`; };
+const refreshQuoteBoard = () => {
+  const board = $('#quoteBoard');
+  if (!board) return;
+  const validProduct = quoteState.products.length > 0;
+  const data = (validProduct ? quoteData() : []).sort((a, b) => new Date(a.quoted_at) - new Date(b.quoted_at));
+  const chartData = data.filter(item => Number.isFinite(quoteCnyPrice(item)));
+  const rows = data.slice().reverse().map(item => `<tr><td>${fmtDay(item.quoted_at)}</td><td>${esc(item.product_name)}</td><td>${esc(item.factory_name)}</td><td><b>${quoteMoney(item)}</b></td><td><b>${quoteCnyMoney(item)}</b></td><td>${item.fx_rate_to_cny ? `${Number(item.fx_rate_to_cny).toFixed(4)}<small> ${fmtDay(item.fx_rate_date)}</small>` : '-'}</td><td>${esc(item.moq || '-')}</td><td>${esc(item.sample_fee || '-')}</td><td>${esc(item.production_days || '-')}</td><td>${esc(item.payment_terms || '-')}</td><td>${esc(quoteRemark(item))}</td><td>${esc(item.source_file_name || item.created_by_name || '-')}</td><td>${esc(item.submitted_by_name || item.created_by_name || '-')}</td><td>${user.role === 'brand' ? `<button class="text-action" onclick="openQuoteEdit(${item.id})">${t('edit')}</button>` : user.role === 'factory' ? `<button class="text-action" onclick="openQuoteCorrection(${item.id})">${t('correct')}</button>` : ''}</td></tr>`).join('') || `<tr><td colspan="14" class="empty">${validProduct ? t('noQuote') : t('productRequired')}</td></tr>`;
+  board.innerHTML = `<div class="quote-grid"><section class="panel"><div class="panel-head"><div><h2>${t('trend')}</h2><p>${t('trendSub')}</p></div></div>${trendChart(chartData)}</section><section class="panel"><div class="panel-head"><div><h2>${t('comparison')}</h2><p>${t('comparisonSub')}</p></div></div><div class="quote-comparison">${comparisonChart(chartData)}</div></section></div><section class="panel"><div class="panel-head"><div><h2>${t('details')}</h2><p>${t('detailsSub')}</p></div></div><div class="table-wrap"><table><thead><tr><th>${t('date')}</th><th>${t('productName')}</th><th>${t('factory')}</th><th>${t('unitPrice')}</th><th>${t('cnyPrice')}</th><th>${t('exchangeRate')}</th><th>${t('moq')}</th><th>${t('sampleFee')}</th><th>${t('cycle')}</th><th>${t('payment')}</th><th>${t('note')}</th><th>${t('source')}</th><th>${t('operator')}</th><th></th></tr></thead><tbody>${rows}</tbody></table></div></section>`;
+};
 function bindQuotePicker(picker) { const key=picker.dataset.quotePicker, type=key==='products'?'product':'factory', trigger=picker.querySelector('[data-picker-trigger]'), menu=picker.querySelector('[data-picker-menu]'), close=()=>{menu.hidden=true;trigger.setAttribute('aria-expanded','false');}; trigger.onclick=event=>{event.stopPropagation();document.querySelectorAll('[data-picker-menu]').forEach(other=>{if(other!==menu){other.hidden=true;other.closest('.multi-picker')?.querySelector('[data-picker-trigger]')?.setAttribute('aria-expanded','false');}});menu.hidden=!menu.hidden;trigger.setAttribute('aria-expanded',String(!menu.hidden));}; picker.querySelectorAll('input[type="checkbox"]').forEach(input=>input.onchange=()=>{quoteState[key]=[...picker.querySelectorAll('input:checked')].map(item=>item.value);refreshPickerSummary(picker);refreshQuoteBoard();});picker.querySelector('[data-picker-search]').oninput=event=>{const query=event.target.value.trim().toLowerCase();picker.querySelectorAll('.picker-option').forEach(option=>option.hidden=!option.textContent.toLowerCase().includes(query));};picker.querySelector('.clear-picker').onclick=()=>{quoteState[key]=[];picker.querySelectorAll('input:checked').forEach(input=>input.checked=false);refreshPickerSummary(picker);refreshQuoteBoard();};picker.querySelector('.select-all-picker').onclick=()=>{quoteState[key]=quoteOptionValues(type);picker.querySelectorAll('input[type="checkbox"]').forEach(input=>input.checked=true);refreshPickerSummary(picker);refreshQuoteBoard();};picker.querySelector('.add-picker-item')?.addEventListener('click',()=>openQuoteOptionForm(type)); return close; }
+function bindQuotePicker(picker) {
+  const key = picker.dataset.quotePicker;
+  const type = key === 'products' ? 'product' : 'factory';
+  const trigger = picker.querySelector('[data-picker-trigger]');
+  const menu = picker.querySelector('[data-picker-menu]');
+  const search = picker.querySelector('[data-picker-search]');
+  const close = () => { menu.hidden = true; trigger.setAttribute('aria-expanded', 'false'); };
+  const filterOptions = () => {
+    const query = search.value.trim().toLocaleLowerCase();
+    picker.querySelectorAll('.picker-option').forEach(option => {
+      const value = option.querySelector('input[type="checkbox"]')?.value.toLocaleLowerCase() || '';
+      option.hidden = Boolean(query) && !value.includes(query);
+    });
+  };
+  trigger.onclick = event => {
+    event.stopPropagation();
+    document.querySelectorAll('[data-picker-menu]').forEach(other => {
+      if (other !== menu) { other.hidden = true; other.closest('.multi-picker')?.querySelector('[data-picker-trigger]')?.setAttribute('aria-expanded', 'false'); }
+    });
+    menu.hidden = !menu.hidden;
+    trigger.setAttribute('aria-expanded', String(!menu.hidden));
+    if (!menu.hidden) search.focus();
+  };
+  picker.addEventListener('pointerdown', event => event.stopPropagation());
+  search.oninput = filterOptions;
+  search.onsearch = filterOptions;
+  picker.querySelectorAll('input[type="checkbox"]').forEach(input => input.onchange = () => {
+    quoteState[key] = [...picker.querySelectorAll('input[type="checkbox"]:checked')].map(item => item.value);
+    refreshPickerSummary(picker);
+    refreshQuoteBoard();
+  });
+  picker.querySelector('.clear-picker').onclick = () => {
+    quoteState[key] = [];
+    picker.querySelectorAll('input[type="checkbox"]:checked').forEach(input => { input.checked = false; });
+    refreshPickerSummary(picker);
+    refreshQuoteBoard();
+  };
+  picker.querySelector('.select-all-picker').onclick = () => {
+    quoteState[key] = quoteOptionValues(type);
+    picker.querySelectorAll('input[type="checkbox"]').forEach(input => { input.checked = true; });
+    refreshPickerSummary(picker);
+    refreshQuoteBoard();
+  };
+  picker.querySelector('.add-picker-item')?.addEventListener('click', () => openQuoteOptionForm(type));
+  return close;
+}
+
 function renderQuotes() {
   const products=quoteOptionValues('product'), factories=quoteOptionValues('factory'); quoteState.products=quoteState.products.filter(item=>products.includes(item));quoteState.factories=quoteState.factories.filter(item=>factories.includes(item)); const factoryEntry=(user.role==='factory'||user.role==='brand')?`<button class="primary" onclick="openQuoteForm()">${t('quoteEntry')}</button>`:'';
   setHeader(t('quoteTitle'),t('quoteSub')); $('#content').innerHTML=`<div class="page"><div class="page-title"><div><h1>${t('quoteTitle')}</h1><p>${t('quoteSub')}</p></div>${factoryEntry}</div><div class="filters quote-filters">${multiPicker('products','product',quoteState.products)}${multiPicker('factories','factory',quoteState.factories)}<input id="quoteOperatorFilter" value="${esc(quoteState.operator)}" placeholder="${t('operatorSearch')||'搜索录入人'}"><small class="filter-hint">${quoteState.products.length?t('allFactories'):t('productRequired')}</small>${user.role==='brand'?`<button type="button" class="outline" onclick="openQuoteSources()">${t('history')}</button><button type="button" class="outline" onclick="openQuoteImport()">${t('import')}</button>`:''}</div><div id="quoteBoard"></div></div>`;
