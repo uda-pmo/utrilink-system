@@ -22,7 +22,7 @@ const supabase = createClient(url, serviceKey, { auth: { persistSession: false, 
 const auth = (req, res, next) => { try { req.user = jwt.verify((req.headers.authorization || '').replace(/^Bearer\s+/i, ''), SECRET); next(); } catch { res.status(401).json({ error: '登录已失效，请重新登录。' }); } };
 const safeUser = u => ({ id: u.id, name: u.name, email: u.email, role: u.role, factory_name: u.factory_name || null });
 const fail = (res, error, fallback = '操作失败。') => res.status(500).json({ error: error?.message || fallback });
-const columns = ['product_name','contract_no','factory_name','batch_no','sku','node','due_date','quantity','formula','formula_version','pack_spec','production_date','shelf_life','expiry_date','progress','status'];
+const columns = ['product_name','contract_no','factory_name','batch_no','sku','node','due_date','quantity','formula','formula_version','pack_spec','production_date','shelf_life','expiry_date','progress','status','order_no','order_date','planned_production_days','actual_production_finish_date','planned_factory_dispatch_date','actual_factory_dispatch_date','planned_arrival_date','actual_arrival_date','logistics_method','packaging_ready_status','order_currency','order_amount','order_fx_rate','order_fx_rate_date','order_cny_amount','order_pm_name','actual_unit_cost','payment_due_date','payment_status','payment_amount','paid_amount','payment_date','manual_status','manual_status_reason'];
 const orderRecord = body => Object.fromEntries(columns.map(column => [column, body[column] === '' ? null : (body[column] ?? (column === 'progress' ? 0 : null))]));
 const productInfoFields = ['product_name', 'factory_name', 'sku', 'contract_no', 'quantity', 'pack_spec', 'formula_version', 'status', 'shelf_life', 'formula'];
 const productInfoLabels = { product_name: '产品名称', factory_name: '工厂', sku: 'SKU 条码', contract_no: '合同号', quantity: '生产数量', pack_spec: '包装规格', formula_version: '配方版本', status: '订单状态', shelf_life: '保质期要求', formula: '完整配方' };
@@ -76,6 +76,106 @@ const canAccessFile = async (user, file) => {
 };
 const canAccessOrder = (user, order) => !isFactory(user) || order.factory_name === user.factory_name;
 const getOrder = async id => supabase.from('nl_orders').select('*').eq('id', id).maybeSingle();
+const asNumber = value => {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+};
+const boardDate = value => value ? String(value).slice(0, 10) : null;
+const boardToday = () => new Date().toISOString().slice(0, 10);
+const daysFromToday = value => {
+  if (!value) return null;
+  const target = new Date(`${String(value).slice(0, 10)}T23:59:59`);
+  return Math.ceil((target - new Date()) / 86400000);
+};
+const boardRiskReasons = (order, orderFiles, milestones) => {
+  const reasons = [];
+  const candidates = milestones.map(item => ({ item, date: item.factory_plan_date || item.brand_required_date || item.plan_date })).filter(item => item.date && !(item.item.actual_finish_date || item.item.actual_date));
+  const nearest = candidates.sort((a, b) => Math.abs(daysFromToday(a.date)) - Math.abs(daysFromToday(b.date)))[0];
+  if (nearest?.date && daysFromToday(nearest.date) < 0) reasons.push('里程碑已逾期');
+  if (order.planned_factory_dispatch_date && !order.actual_factory_dispatch_date && daysFromToday(order.planned_factory_dispatch_date) < 0) reasons.push('出厂交付已逾期');
+  if (order.payment_due_date && order.payment_status !== '已完结' && daysFromToday(order.payment_due_date) < 0) reasons.push('款项已逾期');
+  const types = new Set(orderFiles.map(file => String(file.document_type || '')));
+  if (!types.has('finished_product_coa')) reasons.push('缺少成品 COA');
+  if (!types.has('free_sale_certificate')) reasons.push('缺少自由销售证明');
+  return [...new Set(reasons)];
+};
+const factoryBoardData = async factoryName => {
+  const { data: orderRows, error: orderError } = await supabase.from('nl_orders').select('*').eq('factory_name', factoryName).order('updated_at', { ascending: false });
+  if (orderError) throw orderError;
+  const ids = (orderRows || []).map(item => item.id);
+  const [filesResult, milestoneResult, quoteResult, factoryResult, paymentResult] = await Promise.all([
+    ids.length ? supabase.from('nl_files').select('*').in('order_id', ids).order('created_at', { ascending: false }) : Promise.resolve({ data: [], error: null }),
+    ids.length ? supabase.from('nl_milestones').select('*').in('order_id', ids).order('sequence') : Promise.resolve({ data: [], error: null }),
+    supabase.from('nl_quotes').select('*').eq('factory_name', factoryName).order('quoted_at', { ascending: false }),
+    (async () => { try { return await supabase.from('nl_factories').select('*').eq('name', factoryName).maybeSingle(); } catch (error) { return { data: null, error }; } })(),
+    ids.length ? supabase.from('nl_order_payments').select('*').in('order_id', ids).order('payment_date', { ascending: false }) : Promise.resolve({ data: [], error: null })
+  ]);
+  const requiredErrors = filesResult.error || milestoneResult.error || quoteResult.error;
+  if (requiredErrors) throw requiredErrors;
+  const allFiles = filesResult.data || [], allMilestones = milestoneResult.data || [], allQuotes = quoteResult.data || [], allPayments = paymentResult.error ? [] : (paymentResult.data || []);
+  const rows = (orderRows || []).map(order => {
+    const orderFiles = allFiles.filter(file => file.order_id === order.id);
+    const milestones = allMilestones.filter(item => item.order_id === order.id);
+    const payments = allPayments.filter(item => item.order_id === order.id);
+    const quote = allQuotes.find(item => item.product_name === order.product_name);
+    const originalAmount = asNumber(order.order_amount);
+    const unitPrice = asNumber(quote?.unit_price);
+    const quantity = asNumber(order.quantity);
+    const amount = originalAmount ?? (unitPrice !== null && quantity !== null ? unitPrice * quantity : null);
+    const currency = String(order.order_currency || quote?.currency || 'CNY').toUpperCase();
+    const quoteCnyUnit = asNumber(quote?.cny_unit_price);
+    const cnyAmount = asNumber(order.order_cny_amount) ?? (currency === 'CNY' ? amount : asNumber(order.order_fx_rate) !== null && amount !== null ? amount * asNumber(order.order_fx_rate) : quoteCnyUnit !== null && quantity !== null ? quoteCnyUnit * quantity : null);
+    const finishedCoa = orderFiles.some(file => file.document_type === 'finished_product_coa');
+    const quality = {
+      coa: finishedCoa,
+      microbiology: orderFiles.some(file => /micro|微生物/i.test(String(file.document_type || file.original_name || ''))),
+      heavy_metals: orderFiles.some(file => /heavy|重金属/i.test(String(file.document_type || file.original_name || '')))
+    };
+    const riskReasons = boardRiskReasons(order, orderFiles, milestones);
+    const computedStatus = order.manual_status || (finishedCoa ? '出厂检测已完成' : (order.status || '未完成'));
+    const paidAmount = asNumber(order.paid_amount) ?? payments.reduce((sum, item) => sum + (asNumber(item.amount) || 0), 0);
+    const totalPayment = asNumber(order.payment_amount) ?? amount;
+    return {
+      ...order,
+      order_no: order.order_no || order.contract_no || `订单-${order.id}`,
+      order_date: boardDate(order.order_date || order.created_at),
+      order_currency: currency,
+      order_amount: amount,
+      order_cny_amount: cnyAmount,
+      quote_version: quote ? { id: quote.id, quoted_at: quote.quoted_at, unit_price: quote.unit_price, currency: quote.currency, cny_unit_price: quote.cny_unit_price, source_file_name: quote.source_file_name } : null,
+      planned_production_finish_date: boardDate(order.actual_production_finish_date || order.production_date),
+      planned_factory_dispatch_date: boardDate(order.planned_factory_dispatch_date),
+      actual_factory_dispatch_date: boardDate(order.actual_factory_dispatch_date),
+      planned_arrival_date: boardDate(order.planned_arrival_date || order.due_date),
+      actual_arrival_date: boardDate(order.actual_arrival_date),
+      logistics_method: order.logistics_method || null,
+      packaging_ready_status: order.packaging_ready_status || null,
+      payment_due_date: boardDate(order.payment_due_date),
+      payment_status: order.payment_status || '待确认',
+      paid_amount: paidAmount,
+      payment_amount: totalPayment,
+      paid_ratio: totalPayment ? Math.round((paidAmount / totalPayment) * 100) : 0,
+      payment_date: boardDate(order.payment_date || payments[0]?.payment_date),
+      order_pm_name: order.order_pm_name || order.pm_name || null,
+      status: computedStatus,
+      actual_unit_cost: asNumber(order.actual_unit_cost) ?? (unitPrice !== null ? unitPrice : null),
+      quality,
+      quality_status: Object.values(quality).every(Boolean) ? '报告齐全' : finishedCoa ? 'COA 已上传，报告待补' : '缺少成品 COA',
+      delivery_delayed: Boolean(order.planned_factory_dispatch_date && order.actual_factory_dispatch_date && String(order.actual_factory_dispatch_date) > String(order.planned_factory_dispatch_date)),
+      risk_count: riskReasons.length,
+      risk_reasons: riskReasons,
+      attachments: orderFiles.map(publicFile),
+      milestones,
+      payments
+    };
+  });
+  const factoryInfo = factoryResult.error ? null : factoryResult.data;
+  return {
+    factory: factoryInfo || { name: factoryName, cooperation_status: '在合作', address: null, contact_name: null, contact_email: null, qualifications: [] },
+    orders: rows,
+    generated_at: new Date().toISOString()
+  };
+};
 const broadcastNotification = notification => {
   const message = `event: notification\ndata: ${JSON.stringify(decorateNotification(notification))}\n\n`;
   notificationStreams.forEach(stream => {
@@ -141,6 +241,28 @@ app.post('/api/auth/login', async (req, res) => {
 });
 app.get('/api/auth/me', auth, (req, res) => res.json({ user: req.user }));
 app.get('/api/orders', auth, async (req, res) => { let query = supabase.from('nl_orders').select('*').order('updated_at', { ascending: false }); if (isFactory(req.user)) query = query.eq('factory_name', req.user.factory_name); const { data, error } = await query; if (error) return fail(res, error); res.json(data); });
+app.get('/api/factories/:factoryName/board', auth, async (req, res) => {
+  const factoryName = String(req.params.factoryName || '').trim();
+  if (!factoryName) return res.status(400).json({ error: '缺少工厂名称。' });
+  if (isFactory(req.user) && req.user.factory_name !== factoryName) return res.sendStatus(403);
+  try { res.json(await factoryBoardData(factoryName)); } catch (error) { return fail(res, error, '无法加载工厂详情看板。'); }
+});
+app.get('/api/factories/:factoryName/board/export', auth, async (req, res) => {
+  const factoryName = String(req.params.factoryName || '').trim();
+  if (!factoryName) return res.status(400).json({ error: '缺少工厂名称。' });
+  if (isFactory(req.user) && req.user.factory_name !== factoryName) return res.sendStatus(403);
+  try {
+    const board = await factoryBoardData(factoryName);
+    const fields = [
+      ['订单编号', 'order_no'], ['归属工厂', 'factory_name'], ['SKU/产品名称', 'product_sku_name'], ['配方版本号', 'formula_version'], ['生产实际批次号', 'batch_no'], ['订单数量', 'quantity'], ['原始币种', 'order_currency'], ['下单金额', 'order_amount'], ['人民币金额', 'order_cny_amount'], ['下单时间', 'order_date'], ['计划生产完成', 'planned_production_finish_date'], ['实际生产完成', 'actual_production_finish_date'], ['计划出厂日期', 'planned_factory_dispatch_date'], ['实际出厂日期', 'actual_factory_dispatch_date'], ['计划到货日期', 'planned_arrival_date'], ['实际到货入库日期', 'actual_arrival_date'], ['物流方式', 'logistics_method'], ['包材是否齐套', 'packaging_ready_status'], ['款项到期时间', 'payment_due_date'], ['付款状态', 'payment_status'], ['付款金额', 'payment_amount'], ['已付款比例', 'paid_ratio'], ['付款时间', 'payment_date'], ['订单PM负责人', 'order_pm_name'], ['实际单位成本', 'actual_unit_cost'], ['关联历史报价版本', 'quote_version'], ['订单状态', 'status'], ['检测报告齐全', 'quality_status'], ['交付延期', 'delivery_delayed'], ['风险事项计数', 'risk_count'], ['附件链接', 'attachment_links']
+    ];
+    const rows = board.orders.map(order => Object.fromEntries(fields.map(([label, key]) => [label, key === 'product_sku_name' ? `${order.product_name || ''}${order.sku ? ` / ${order.sku}` : ''}` : key === 'quote_version' ? order.quote_version ? `${order.quote_version.quoted_at} · ${order.quote_version.currency} ${order.quote_version.unit_price}` : '' : key === 'attachment_links' ? order.attachments.map(file => `/api/files/${file.id}`).join('\n') : order[key] ?? ''])));
+    const sheet = XLSX.utils.json_to_sheet(rows);
+    const workbook = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(workbook, sheet, '工厂订单看板');
+    const buffer = XLSX.write(workbook, { type: 'buffer', bookType: 'xlsx' });
+    res.type('application/vnd.openxmlformats-officedocument.spreadsheetml.sheet').attachment(`${normalizeFilename(factoryName)}-订单详情看板.xlsx`).send(buffer);
+  } catch (error) { return fail(res, error, '导出工厂订单看板失败。'); }
+});
 app.get('/api/orders/:id', auth, async (req, res) => {
   const order = await orderAccess(req, res, req.params.id); if (!order) return;
   await ensureMilestones(order.id);
