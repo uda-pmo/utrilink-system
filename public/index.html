@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>NutriLink | 代工协同中心</title>
+  <link rel="stylesheet" href="/styles.css">
+  <link rel="stylesheet" href="/order-detail.css">
+  <style>.contract-board{margin:0 23px 20px;overflow:hidden}.contract-board .panel-head p,.document-table .panel-head p{margin:5px 0 0;color:#66736d}.contract-grid{display:grid;grid-template-columns:1fr 1fr}.contract-cell{min-height:136px;padding:23px 36px;border-right:1px solid #dce4df;display:grid;align-content:start;gap:12px}.contract-cell:last-child{border-right:0}.contract-cell small{color:#66736d;font-size:13px}.contract-cell b{font-size:16px}.contract-cell span{display:flex;gap:8px}.contract-cell .upload-contract{display:none}.upload-contract{display:inline-flex;align-items:center;cursor:pointer}.document-table{margin:0 23px 20px;overflow:hidden}.document-table .panel-head>span{display:flex;align-items:center;gap:9px}.document-table form{display:flex;align-items:center;gap:8px}.document-table select,.document-table input{border:1px solid #ccd9d2;border-radius:5px;padding:8px;background:#fff}.document-name{display:inline-flex;align-items:center;gap:9px}.file-kind{background:#fbe4e1;color:#bd3831;border-radius:5px;padding:8px 6px;font-size:10px;font-weight:bold;min-width:34px;text-align:center}.access-badge{display:inline-block;background:#e2f3df;color:#176b4a;border-radius:12px;padding:4px 9px;font-size:11px}@media(max-width:720px){.contract-grid{grid-template-columns:1fr}.contract-cell{border-right:0;border-bottom:1px solid #dce4df}.document-table .panel-head{align-items:start;flex-direction:column}.document-table .panel-head>span,.document-table form{flex-wrap:wrap}}</style>
+</head>
+<body>
+  <section id="auth" class="auth">
+    <form id="authForm" class="auth-card">
+      <div class="brand"><i>N</i><span>NutriLink</span></div>
+      <h1>代工协同中心</h1>
+      <p>登录后统一管理合同、生产节点与归档文件。</p>
+      <label>姓名（首次注册）<input name="name" placeholder="林雨"></label>
+      <label>工作邮箱<input name="email" type="email" required placeholder="you@company.com"></label>
+      <label>密码<input name="password" type="password" required minlength="8" placeholder="至少 8 位"></label>
+      <label>账号类型<select name="role"><option value="brand">品牌方</option><option value="factory">工厂</option></select></label>
+      <label>工厂名称（工厂账号必填）<input name="factory_name" placeholder="例如：NOVAREX"></label>
+      <button type="submit" class="primary">登录</button>
+      <button type="button" id="register" class="secondary">创建账号</button>
+      <small id="authError"></small>
+    </form>
+  </section>
+
+  <div id="app" class="app-shell" hidden>
+    <aside class="sidebar">
+      <div class="brand"><i>N</i><span>NutriLink</span></div>
+      <p class="workspace-label">跨境保健品代工协同</p>
+      <nav aria-label="主导航">
+        <button class="nav active" data-view="dashboard">工作看板</button>
+        <button class="nav" data-view="orders">代工订单</button>
+        <button class="nav" data-view="documents">文档归档</button>
+        <button class="nav" data-view="factories">互联工厂</button>
+        <button class="nav" data-view="quotes">报价与成本</button>
+        <button class="nav" data-view="risks">风险看板</button>
+      </nav>
+      <div class="account"><b id="who"></b><small id="role"></small><button id="logout">退出登录</button></div>
+    </aside>
+    <main>
+      <header class="topbar">
+        <div><b id="crumb">工作看板</b><span id="subtitle">实时追踪跨境代工订单与合规文件状态</span></div>
+        <div class="header-actions"><button id="export" class="outline" title="导出当前列表">导出</button><button id="refresh" class="outline" type="button" title="刷新当前页面">刷新</button><button id="newOrder" class="primary">+ 新建代工订单</button><select id="language" class="language-select" aria-label="Language"><option value="zh">简体中文</option><option value="en">English</option><option value="ko">한국어</option></select></div>
+      </header>
+      <section id="content"></section>
+    </main>
+  </div>
+
+  <dialog id="orderModal" class="modal"><form id="orderForm"></form></dialog>
+  <dialog id="detailModal" class="modal detail-modal"><div id="detailBody"></div></dialog>
+  <dialog id="reviewModal" class="modal"><form id="reviewForm"></form></dialog>
+  <dialog id="quoteModal" class="modal"><form id="quoteForm"></form></dialog>
+  <dialog id="quoteSourcesModal" class="modal quote-sources-modal"><div id="quoteSourcesBody"></div></dialog>
+  <dialog id="quoteImportModal" class="modal"><form id="quoteImportForm"></form></dialog>
+  <dialog id="milestoneModal" class="modal milestone-modal"><div id="milestoneModalBody"></div></dialog>
+  <dialog id="orderTodoModal" class="modal order-todo-modal"><div id="orderTodoBody"></div></dialog>
+  <dialog id="reminderModal" class="modal"><form id="reminderForm"></form></dialog>
+  <div id="filePreviewModal" class="modal preview-modal" hidden role="dialog" aria-modal="true" aria-labelledby="filePreviewTitle"><div class="preview-modal-head"><div><h2 id="filePreviewTitle">文件预览</h2><p id="filePreviewMeta">正在加载文件</p></div><button type="button" class="preview-close" title="关闭预览" aria-label="关闭预览" onclick="closeFilePreview()">×</button></div><iframe id="filePreviewFrame" title="文件预览"></iframe></div>
+  <script src="/app.js"></script>
+</body>
+</html>
