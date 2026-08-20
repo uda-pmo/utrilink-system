@@ -45,6 +45,7 @@ create table if not exists public.nl_factories (
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
+alter table public.nl_factories add column if not exists introduction text;
 
 insert into public.nl_factories (name)
 select distinct factory_name from public.nl_orders
