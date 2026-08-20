@@ -171,7 +171,7 @@ const factoryBoardData = async factoryName => {
   });
   const factoryInfo = factoryResult.error ? null : factoryResult.data;
   return {
-    factory: factoryInfo || { name: factoryName, cooperation_status: '在合作', address: null, contact_name: null, contact_email: null, qualifications: [] },
+    factory: factoryInfo || { name: factoryName, cooperation_status: '在合作', address: null, contact_name: null, contact_email: null, introduction: null, qualifications: [] },
     orders: rows,
     generated_at: new Date().toISOString()
   };
@@ -246,6 +246,22 @@ app.get('/api/factories/:factoryName/board', auth, async (req, res) => {
   if (!factoryName) return res.status(400).json({ error: '缺少工厂名称。' });
   if (isFactory(req.user) && req.user.factory_name !== factoryName) return res.sendStatus(403);
   try { res.json(await factoryBoardData(factoryName)); } catch (error) { return fail(res, error, '无法加载工厂详情看板。'); }
+});
+app.put('/api/factories/:factoryName', auth, async (req, res) => {
+  if (isFactory(req.user)) return res.status(403).json({ error: '仅品牌方可以编辑工厂基础信息。' });
+  const factoryName = String(req.params.factoryName || '').trim();
+  if (!factoryName) return res.status(400).json({ error: '缺少工厂名称。' });
+  const allowed = ['cooperation_status', 'address', 'contact_name', 'contact_email', 'introduction', 'qualifications'];
+  const payload = Object.fromEntries(allowed.filter(field => req.body[field] !== undefined).map(field => {
+    if (field === 'qualifications') return [field, Array.isArray(req.body[field]) ? req.body[field].filter(Boolean).slice(0, 30) : []];
+    return [field, req.body[field] === '' ? null : String(req.body[field]).trim()];
+  }));
+  if (!Object.keys(payload).length) return res.status(400).json({ error: '没有可保存的工厂信息。' });
+  payload.updated_at = new Date().toISOString();
+  const { data, error } = await supabase.from('nl_factories').update(payload).eq('name', factoryName).select('*').maybeSingle();
+  if (error) return fail(res, error);
+  if (!data) return res.status(404).json({ error: '未找到该工厂信息，请先执行数据库迁移。' });
+  res.json(data);
 });
 app.get('/api/factories/:factoryName/board/export', auth, async (req, res) => {
   const factoryName = String(req.params.factoryName || '').trim();
