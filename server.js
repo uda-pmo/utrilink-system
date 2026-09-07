@@ -19,6 +19,7 @@ const resendApiKey = process.env.RESEND_API_KEY;
 const reminderEmailFrom = process.env.REMINDER_EMAIL_FROM;
 if (!SECRET || !url || !serviceKey) throw new Error('JWT_SECRET, SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required.');
 const supabase = createClient(url, serviceKey, { auth: { persistSession: false, autoRefreshToken: false } });
+app.get('/api/health', (req, res) => res.json({ ok: true, service: 'nutrilink-system' }));
 const auth = (req, res, next) => { try { req.user = jwt.verify((req.headers.authorization || '').replace(/^Bearer\s+/i, ''), SECRET); next(); } catch { res.status(401).json({ error: '登录已失效，请重新登录。' }); } };
 const safeUser = u => ({ id: u.id, name: u.name, email: u.email, role: u.role, factory_name: u.factory_name || null });
 const fail = (res, error, fallback = '操作失败。') => res.status(500).json({ error: error?.message || fallback });
